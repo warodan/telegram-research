@@ -1,0 +1,22 @@
+# Scripts run through sh — CRLF breaks them on macOS and Linux (bad interpreter).
+*.sh text eol=lf
+
+# Python is executed directly too; a shebang followed by CR is a bad interpreter.
+*.py text eol=lf
+
+# Everything else is text with LF, so the content does not depend on the cloner's settings.
+*.md text eol=lf
+*.json text eol=lf
+*.svg text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# LICENSE has no extension — pin it too.
+LICENSE text eol=lf
+
+# Test fixtures are captured bytes: saved pages, raw HTTP headers (which are
+# CRLF by the protocol), RSS. Git must not touch a single byte of them.
+# Two directories, because the corpus lives in two places: the full one here
+# with the suite, and the 10 pages `selftest` parses inside the skill folder.
+tests/fixtures/** -text
+skills/telegram-research/tests/fixtures/** -text

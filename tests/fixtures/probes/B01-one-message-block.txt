@@ -1,0 +1,38 @@
+iv class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap user-color-12 js-widget_message" data-post="durov/525" data-view="eyJjIjotMTAwNjUwMzEyMiwicCI6NTI1LCJ0IjoxNzg3NDMxNDM1LCJoIjoiMGM5ZGUyYWFmMmUxNjM1YjBkIn0">
+  <div class="tgme_widget_message_user"><a href="https://t.me/durov"><i class="tgme_widget_message_user_photo bgcolor2" data-content="P"><img src="https://cdn4.telesco.pe/file/pfWZlqDTtIKeg9Qe4v-mGCCLUGf0p9Vj3yivQ8U6ComWTmaCwbKhce95P2bFI22lJvwng0odlTkWdyMNyZ6bPTc0AOpX4p8upQDVay4jfGBZgfYYE3wIl-cS95TMi_fGzygFdeKYaT9esXNTqQHS8crZbIlKTQaw6mDhKSkBvZbFVhja77ComGj-cPtIub1ATTHM78ufaQqPhaVA0vCXskkFAtEPZtyjN-GB0f1sLRikIL14Zl3ANlM6YnPi6g3I_b2SBxQCZQ-IZ3l1b6_IVHuTzFH9TsjvjFycCukmqUjpJC3IrXj1jv9l8J51_b0_QGmbenROPg0h0M6kONwkjQ.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/durov"><span dir="auto">Pavel Durov</span></a></div>
+
+
+<div class="media_supported_cont"><div class="tgme_widget_message_text js-message_text" dir="auto"><tg-emoji emoji-id="5375338737028841420"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9484.png')"><b>🔄</b></i></tg-emoji> Telegram’s <a href="https://telegram.org/blog/watch-apps-and-more" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);">new update</a> is out. Lots of great new features.<br/><br/><tg-emoji emoji-id="5325774161597967162"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9882.png')"><b>😂</b></i></tg-emoji> But most importantly: the announcement is actually fun to read.</div></div><div class="media_not_supported_cont"><div class="message_media_not_supported_wrap">
+  <div class="message_media_not_supported">
+    <div class="message_media_not_supported_label">Please open Telegram to view this post</div>
+    <a href="https://t.me/durov/525" class="message_media_view_in_telegram">VIEW IN TELEGRAM</a>
+  </div>
+</div></div><a class="tgme_widget_message_link_preview" href="https://telegram.org/blog/watch-apps-and-more">
+  
+  <div class="link_preview_site_name accent_color" dir="auto">Telegram</div>
+  <i class="link_preview_image" style="background-image:url('https://cdn4.telesco.pe/file/Rv7kp0JuFrEpOCkkI1T2g4vwZqEP619TAzlWfoKS-e5PxecPCNOXsd-wOCd8AHjU8XdtwN91MxuuVM7rtU4zUK5QA-djwHoisYseZU1E2s8v_UGVieAnsAYTHVRsVaWo6dKG-6FK7Arvsbrtqk9SQEDPiBRu1OhoiN9e5aarvoWK-OTAEw6FxlZWCjBMmIUigdI8rV4pXbEQQYo6Mm8XyAVbIGZ2-XMF2UanhLkKwCT5SnxO1z_Xl2PQb3mY8KN7K_xZTcjqcPhOHstKSJ9ysGQsUCSlEiKqJcerG6LHEkibSrCVM6KR3Z7tt2r7LAeluTpxXHLLvGmCRZzrAT4utQ.jpg');padding-top:68.375%"></i>
+  <div class="link_preview_title" dir="auto">Smartwatch Apps, Rich Text for Bots, AI Guardians for Groups, and Much More</div>
+  <div class="link_preview_description" dir="auto">Today’s update brings Telegram to Apple Watch and Android smartwatches, adds filthy rich text for bots, lets AI admins screen new group members, and introduces smarter polls, browser controls, and much more.</div>
+</a>
+<div class="tgme_widget_message_reactions js-message_reactions"><span class="tgme_reaction tgme_reaction_paid"><i class="icon icon-telegram-stars"></i>4.44K</span><span class="tgme_reaction"><tg-emoji emoji-id="5265077361648368841"></tg-emoji>19.8K</span><span class="tgme_reaction"><tg-emoji emoji-id="5465587407350942612"></tg-emoji>8.04K</span><span class="tgme_reaction"><tg-emoji emoji-id="5399847211989246390"></tg-emoji>6.05K</span><span class="tgme_reaction"><tg-emoji emoji-id="5936157098181135162"></tg-emoji>1.16K</span><span class="tgme_reaction"><tg-emoji emoji-id="5373223594484587136"></tg-emoji>244</span></div><div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">16.3M</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><span class="tgme_widget_message_from_author" dir="auto">Pavel Durov</span>,&nbsp;<a class="tgme_widget_message_date" href="https://t.me/durov/525"><time datetime="2026-06-12T19:15:19+00:00" class="time">19:15</time></a></span>
+  </div>
+</div>
+  </div>
+  
+</div></div>

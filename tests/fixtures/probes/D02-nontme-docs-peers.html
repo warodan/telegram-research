@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  Authored fixture, not a saved page.
+
+  The third case of the same test: a smaller documentation page from the same
+  kind of site. Kept as its own case because the original three captures were
+  three different bodies, and one of them being short is part of what the test
+  covered.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Peer database - Example Docs</title>
+<meta property="og:title" content="Peer database - Example Docs">
+<meta property="og:description" content="How an example client stores peers it has seen.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body class="docs-page">
+<div class="docs-wrap">
+  <nav class="docs-nav"><a href="/docs">Docs</a> <a href="/docs/api">API</a></nav>
+
+  <article class="docs-body">
+    <h1 id="peer-database">Peer database</h1>
+    <p>A client keeps a local database of the peers it has seen, so that it can
+    turn an identifier into a request without asking the server again.</p>
+
+    <h3 id="constructors">Constructors</h3>
+    <ul>
+      <li><code>inputPeerEmpty</code></li>
+      <li><code>inputPeerSelf</code></li>
+      <li><code>inputPeerChat</code></li>
+      <li><code>inputPeerUser</code></li>
+      <li><code>inputPeerChannel</code></li>
+    </ul>
+
+    <h3 id="access-hashes">Access hashes</h3>
+    <p>Each identifier is paired with an access hash. The pair is only valid for
+    the session that obtained it, which is why a client caches both together.</p>
+
+    <h3 id="notes">Notes</h3>
+    <p>This page is reference material, not a profile card. It has no card
+    markup, no message markup and no account on it.</p>
+  </article>
+
+  <footer class="docs-footer">Example documentation. Nothing here is a real service.</footer>
+</div>
+</body>
+</html>

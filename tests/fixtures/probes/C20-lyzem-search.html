@@ -1,0 +1,248 @@
+<!doctype html>
+<!--
+  Authored fixture, not a saved page.
+
+  It stands in for a capture of a lyzem.com search-result page, the surface
+  `discover.parse_lyzem` reads. The original capture was a verbatim copy of
+  somebody else's page, listing real Telegram channels -- among them outlets
+  this repository has no business republishing -- together with that site's
+  abuse-report form and its telemetry. Reproduced here is only the shape the
+  tests read: the claimed result count, the page-size control the parser reads
+  the parameter name out of, and ten result blocks that each carry the same
+  permalink twice, on the title anchor and on the body anchor.
+
+  Every channel named below is a placeholder (example_channel_NN,
+  example_group_NN). None of them is a real account.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Search results</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 14px/1.5 sans-serif; margin: 0; }
+  .search-result { border-bottom: 1px solid #ddd; padding: 8px 0; }
+  em { font-style: normal; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<form method="GET" action="/search">
+  <div class="searchbar">
+    <input aria-label="Search" name="q" type="search" value="hanoi" class="searchbar-input" />
+    <button aria-label="Perform search" class="searchbar-btn"></button>
+  </div>
+
+  <div class="info-line">
+    <div id="search-rollover">
+      <p class="is-size-6">51 results &ndash; 9ms</p>
+      <label><span>Per page: </span>
+        <select name="per-page">
+          <option value="10">10</option>
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
+    </div>
+  </div>
+</form>
+
+<ul class="search-results">
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_01/1462"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_01/1462" target="_blank">
+          The delegation landed in <em>Hanoi</em> on Tuesday morning and went
+          straight into talks that ran past midnight
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_group_02/86"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_group_02/86" target="_blank">
+          Warehouse for rent near the <em>Hanoi</em> ring road, 24m x 24m,
+          price on request, write in the chat
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_03/17835"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_03/17835" target="_blank">
+          Rail, energy and vaccine agreements were signed during the visit,
+          alongside an aircraft order placed by <em>Hanoi</em>
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_04/456"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_04/456" target="_blank">
+          Alumni day in <em>Hanoi</em>, how it went: photographs, a short
+          speech and far too much coffee
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_group_05/6204"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_group_05/6204" target="_blank">
+          Fire at a storage yard in a northern district of <em>Hanoi</em>,
+          no casualties reported so far
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_06/26976"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_06/26976" target="_blank">
+          A convention on cybercrime was opened for signature at a ceremony in
+          <em>Hanoi</em> this week
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_07/78"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_07/78" target="_blank">
+          Archive footage of the declaration being read on the main square in
+          <em>Hanoi</em>
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_group_08/78"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_group_08/78" target="_blank">
+          Same clip reposted in a second chat, which is why two blocks on this
+          page point at <em>Hanoi</em> with the same words
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_09/3582"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_09/3582" target="_blank">
+          Weather note: heavy rain expected over <em>Hanoi</em> until the end
+          of the week
+        </a>
+      </p>
+    </div>
+  </li>
+
+  <li class="search-result">
+    <div class="search-result-type-wrapper" title="post">
+      <div class="search-result-type"></div>
+      <div class="search-result-type-img"><div class="search-post"><span>post</span></div></div>
+    </div>
+    <div class="search-result-info">
+      <p class="search-result-title">
+        <a href="https://t.me/example_channel_10/3582"> </a>
+      </p>
+      <p class="search-result-descr">
+        <a href="https://t.me/example_channel_10/3582" target="_blank">
+          Apartment listings collected for <em>Hanoi</em> districts, updated
+          every Monday
+        </a>
+      </p>
+    </div>
+  </li>
+
+</ul>
+
+<div class="pager">
+  <ul>
+    <li class="pager-current">1</li>
+    <li><a href="/search?q=hanoi&amp;f=messages&amp;p=2&amp;per-page=10">2</a></li>
+    <li><a href="/search?q=hanoi&amp;f=messages&amp;p=3&amp;per-page=10">3</a></li>
+  </ul>
+</div>
+
+<footer class="main-footer">
+  <p>Example search page. Nothing here is a real service or a real channel.</p>
+</footer>
+
+</body>
+</html>

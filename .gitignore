@@ -1,0 +1,31 @@
+# OS and editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Run artefacts
+telegram-runs/
+store/
+*.log
+
+# local drafts and notes
+scratch/
+*.local.md
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# node
+node_modules/
+package-lock.json

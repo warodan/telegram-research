@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<!--
+  Authored fixture, not a saved page.
+
+  It stands in for a capture of a large API-documentation page -- an HTTP 200
+  that is plainly not a t.me profile card, yet whose `og:title` is a real name
+  and so used to be classified `taken=True type=user`. The original capture was
+  817 KB of somebody else's documentation; the shape the test reads is small.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bot API - Example Docs</title>
+<meta property="og:title" content="Bot API - Example Docs">
+<meta property="og:description" content="Reference for the example bot interface.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body class="docs-page">
+<div class="docs-wrap">
+  <nav class="docs-nav">
+    <a href="/docs">Docs</a>
+    <a href="/docs/bots">Bots</a>
+    <a href="/docs/api">API</a>
+  </nav>
+
+  <article class="docs-body">
+    <h1 id="bot-api">Bot API</h1>
+    <p>This page documents an example HTTP interface for bots. It is reference
+    material on a documentation site, not a profile card, and nothing on it
+    describes a person or an account.</p>
+
+    <h3 id="getting-updates">Getting updates</h3>
+    <p>There are two mutually exclusive ways of receiving updates.</p>
+    <table class="table">
+      <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td>update_id</td><td>Integer</td><td>The update's unique identifier.</td></tr>
+        <tr><td>message</td><td>Message</td><td>Optional. New incoming message.</td></tr>
+        <tr><td>edited_message</td><td>Message</td><td>Optional. Edited message.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="sendmessage">sendMessage</h3>
+    <p>Use this method to send text messages. On success, the sent message is
+    returned.</p>
+    <table class="table">
+      <thead><tr><th>Parameter</th><th>Type</th><th>Required</th></tr></thead>
+      <tbody>
+        <tr><td>chat_id</td><td>Integer or String</td><td>Yes</td></tr>
+        <tr><td>text</td><td>String</td><td>Yes</td></tr>
+        <tr><td>parse_mode</td><td>String</td><td>Optional</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="errors">Errors</h3>
+    <p>In case of an unsuccessful request, a machine-readable error code and a
+    human-readable description are returned.</p>
+    <pre><code>{"ok": false, "error_code": 400, "description": "Bad Request"}</code></pre>
+  </article>
+
+  <footer class="docs-footer">Example documentation. Nothing here is a real service.</footer>
+</div>
+</body>
+</html>

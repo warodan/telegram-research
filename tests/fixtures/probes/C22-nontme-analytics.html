@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!--
+  Authored fixture, not a saved page.
+
+  It stands in for a capture of a commercial Telegram-analytics site that used
+  to come back `taken=True type=user` from `tgweb`: an HTTP 200 whose `og:title`
+  is a real name rather than the literal `Telegram: ...`, and which carries
+  `data-post` attributes of its own while having no t.me card markup at all.
+  The original capture was 841 KB of somebody else's site, complete with their
+  verification and telemetry ids, so it is not something this repository should
+  republish. Everything the test reads is reproduced here.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Каталог каналов — аналитика</title>
+<meta property="og:title" content="Каталог каналов">
+<meta property="og:description" content="Статистика открытых каналов и групп: подписчики, охват, прирост.">
+<meta property="og:type" content="website">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 14px/1.5 sans-serif; margin: 0; }
+  .card { border: 1px solid #ddd; padding: 12px; margin: 8px; }
+  .card__count { color: #777; }
+</style>
+</head>
+<body>
+<header class="site-header">
+  <a class="site-header__logo" href="/">Каталог каналов</a>
+  <nav class="site-nav">
+    <a href="/catalog">Каталог</a>
+    <a href="/top">Топ</a>
+    <a href="/pricing">Тарифы</a>
+  </nav>
+</header>
+
+<main>
+  <h1>Аналитика открытых каналов</h1>
+  <p>Сервис показывает публичную статистику каналов и групп. Ниже — карточки
+  каталога. Обратите внимание: карточка ссылается на пост чужим атрибутом
+  <code>data-post</code>, но никакой разметки t.me на странице нет.</p>
+
+  <section class="catalog">
+    <article class="card" data-post="examplechannel/101">
+      <h2 class="card__title">Example Channel</h2>
+      <div class="card__count">120 400 подписчиков</div>
+      <p class="card__snippet">Публичный канал из каталога.</p>
+    </article>
+    <article class="card" data-post="examplechannel/102">
+      <h2 class="card__title">Example Channel</h2>
+      <div class="card__count">120 400 подписчиков</div>
+      <p class="card__snippet">Ещё одна карточка того же канала.</p>
+    </article>
+    <article class="card" data-post="examplegroup/17">
+      <h2 class="card__title">Example Group</h2>
+      <div class="card__count">4 210 участников</div>
+      <p class="card__snippet">Групповой чат из каталога.</p>
+    </article>
+  </section>
+
+  <section class="promo">
+    <h2>Тарифы</h2>
+    <table class="pricing">
+      <tr><th>План</th><th>Каналов</th><th>Цена</th></tr>
+      <tr><td>Базовый</td><td>10</td><td>0</td></tr>
+      <tr><td>Про</td><td>1000</td><td>—</td></tr>
+    </table>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <p>Пример страницы стороннего сервиса. Все имена вымышлены.</p>
+</footer>
+</body>
+</html>
