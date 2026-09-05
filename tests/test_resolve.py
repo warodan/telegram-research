@@ -22,6 +22,7 @@ if str(SCRIPTS) not in sys.path:
 
 import pytest
 
+import config as configmod
 from config import local_tz
 from resolve import (
     AccountBusy,
@@ -34,6 +35,22 @@ from resolve import (
     peer_is_usable,
     session_fingerprint,
 )
+
+
+@pytest.fixture
+def quick_guards(monkeypatch):
+    """The guard pair, scaled down, for tests that hold a guard on purpose.
+
+    The wait on a write guard is deliberately LONGER than the age at which the
+    guard counts as dead, so a waiter always outlives a guard left behind by a
+    killed process and breaks it instead of giving up one turn short. That makes
+    a test which pins a guard open wait out the whole real timeout. Both numbers
+    move together here, so what these tests run under is still the invariant and
+    not a special case of it.
+    """
+    monkeypatch.setattr(configmod, "GUARD_TIMEOUT", 0.3)
+    monkeypatch.setattr(configmod, "GUARD_STALE_AFTER", 0.2)
+
 
 
 # --------------------------------------------------------------------------
@@ -789,7 +806,7 @@ def test_release_does_not_delete_a_lock_someone_else_now_holds(tmp_path):
         AccountLock(lock_path, stale_after=86_400.0).acquire()
 
 
-def test_breaking_a_stale_lock_is_serialised(tmp_path):
+def test_breaking_a_stale_lock_is_serialised(tmp_path, quick_guards):
     """Two processes breaking the same stale lock both ended up holding it: the
     unlink was unconditional, so B deleted the lock A had just created."""
     lock_path = tmp_path / "account.lock"
@@ -1433,7 +1450,7 @@ def test_a_damaged_reservation_list_refuses(tmp_path, label):
 # --------------------------------------------------------------------------
 # touch() must not resurrect a lock that was legitimately broken
 # --------------------------------------------------------------------------
-def test_touch_cannot_resurrect_a_lock_that_was_legitimately_broken(tmp_path):
+def test_touch_cannot_resurrect_a_lock_that_was_legitimately_broken(tmp_path, quick_guards):
     """Filed as PLAUSIBLE ("the window is the sub-millisecond gap between
     `self._read()` and the replace"), and CONFIRMED: forcing the interleaving
     at exactly that statement boundary, against the file restored from git,
@@ -1496,3 +1513,339 @@ def test_touch_cannot_resurrect_a_lock_that_was_legitimately_broken(tmp_path):
     finally:
         b.release()
         a.release()
+
+
+# --------------------------------------------------------------------------
+# The monotonic twin belongs to ONE boot
+# --------------------------------------------------------------------------
+def test_a_monotonic_freeze_does_not_survive_a_reboot(tmp_path):
+    """`mono_now >= mono_at_freeze` was not a "same boot" test at all.
+
+    `time.monotonic()` restarts at zero when the machine boots, so the old
+    comparison came true again the moment a rebooted machine outlived its
+    previous uptime -- and from then on the monotonic deadline was believed
+    again. Measured on the history log, which shares this code: a wall deadline
+    three days expired and the freeze still held, with (before `clear_freeze`)
+    no way to lift it.
+
+    A reboot is simulated the only way it can be without one: the state carries
+    the monotonic numbers of a previous boot, and the boot estimate recorded
+    beside them does not match the one this machine has now.
+    """
+    path = tmp_path / "ledger.json"
+    ledger = ResolveLedger(path)
+    now = time.time()
+    boot_now = now - time.monotonic()
+    state = LedgerState(
+        date=_today(),
+        # The wall deadline expired three days ago: nothing but the monotonic
+        # twin can be holding this freeze open.
+        frozen_until=now - 3 * 86400,
+        frozen_reason="FloodWait on resolve of @tdlibchat",
+        # A previous boot: 100 s of uptime when the freeze was taken, and a
+        # machine that booted four days before this one did.
+        mono_at_freeze=100.0,
+        frozen_until_mono=time.monotonic() + 36468,
+        boot_at_freeze=boot_now - 4 * 86400,
+    )
+    ledger.write(state)
+    assert ledger.frozen_for(ledger.read(), now) <= 0
+    ledger.check_resolve(now=now)                    # does not raise: the wait is over
+
+    # The same numbers WITH this boot's estimate are still a live freeze, so
+    # what changed is the boot test and not the deadline.
+    state.boot_at_freeze = boot_now
+    ledger.write(state)
+    assert ledger.frozen_for(ledger.read(), now) > 36000
+    with pytest.raises(ResolveFrozen):
+        ledger.check_resolve(now=now)
+
+
+def test_a_freeze_records_which_boot_its_monotonic_deadline_belongs_to(tmp_path):
+    """The evidence has to be written, or there is nothing to compare later."""
+    ledger = ResolveLedger(tmp_path / "ledger.json")
+    ledger.freeze(600, "FloodWait on resolve of @tdlibchat")
+    state = ledger.read()
+    assert state.frozen_until_mono > 0
+    assert abs(state.boot_at_freeze - (time.time() - time.monotonic())) < 5.0
+    # And it round-trips through the file rather than living in the object.
+    reread = ResolveLedger(tmp_path / "ledger.json").read()
+    assert reread.boot_at_freeze == state.boot_at_freeze
+
+
+def test_a_state_with_no_boot_estimate_does_not_trust_the_monotonic_deadline(tmp_path):
+    """A file written by an older build carries no evidence about the boot.
+
+    Believing a monotonic deadline whose boot is unknown is exactly the defect.
+    The wall deadline still applies, and `freeze` writes a fresh pair the next
+    time Telegram says anything at all.
+    """
+    path = tmp_path / "ledger.json"
+    ledger = ResolveLedger(path)
+    now = time.time()
+    ledger.write(LedgerState(date=_today(), frozen_until=now - 10,
+                             mono_at_freeze=1.0,
+                             frozen_until_mono=time.monotonic() + 36468))
+    assert ledger.frozen_for(ledger.read(), now) <= 0
+
+
+# --------------------------------------------------------------------------
+# The join budget is reserved, not charged afterwards
+# --------------------------------------------------------------------------
+def test_a_join_is_counted_before_the_call_not_after(tmp_path):
+    ledger = ResolveLedger(tmp_path / "ledger.json", join_ceiling=3)
+    ledger.reserve_join()
+    assert ledger.read().joins == 1
+
+
+def test_reserve_join_refuses_at_the_ceiling_and_counts_nothing(tmp_path):
+    ledger = ResolveLedger(tmp_path / "ledger.json", join_ceiling=2)
+    ledger.reserve_join()
+    ledger.reserve_join()
+    with pytest.raises(BudgetExhausted) as exc:
+        ledger.reserve_join()
+    assert "ceiling is 2" in str(exc.value)
+    assert ledger.read().joins == 2, "a refused join is not a spent one"
+
+
+def test_the_join_check_and_the_join_count_are_one_write(tmp_path):
+    """`check_join()` read and `record_join()` wrote one call later.
+
+    Two processes at the ceiling both read the same number and both joined. The
+    reservation does the check inside the guarded read-modify-write, so a second
+    caller reads the count the first one has already taken.
+    """
+    path = tmp_path / "ledger.json"
+    a = ResolveLedger(path, join_ceiling=1)
+    b = ResolveLedger(path, join_ceiling=1)
+    a.reserve_join()
+    with pytest.raises(BudgetExhausted):
+        b.reserve_join()
+    assert a.read().joins == 1
+
+
+# --------------------------------------------------------------------------
+# release() is serialised by the same guard as breaking
+# --------------------------------------------------------------------------
+def test_release_does_not_delete_a_lock_that_was_broken_under_it(tmp_path, quick_guards):
+    """The race `touch` was already wrapped against, on the way OUT.
+
+    `owns_the_file()` reads and `unlink` follows it. A lock legitimately broken
+    between those two statements -- the holder had gone quiet long enough to
+    look stale -- was deleted by its PREVIOUS owner, and the new holder then ran
+    with no lock file at all, so a third process could take the account
+    alongside it.
+    """
+    import resolve as resolvemod
+
+    path = tmp_path / "account.lock"
+    a = AccountLock(path, stale_after=0.0)
+    b = AccountLock(path, stale_after=0.0)
+    a.acquire()
+
+    real_read = resolvemod.AccountLock._read
+    seen = {"reads": 0, "b_took_it": False}
+
+    def racing_read(self):
+        out = real_read(self)
+        if self is a:
+            seen["reads"] += 1
+            # After A's ownership check has read the file, before the unlink.
+            if seen["reads"] == 1 and not seen["b_took_it"]:
+                try:
+                    b.acquire()
+                    seen["b_took_it"] = True
+                except AccountBusy:
+                    pass
+        return out
+
+    resolvemod.AccountLock._read = racing_read
+    try:
+        a.release()
+    finally:
+        resolvemod.AccountLock._read = real_read
+
+    try:
+        # The discriminating assertion. Without the guard B broke A's stale-looking
+        # lock in that window and took it, and A's unlink -- one statement later,
+        # on an ownership answer that was already out of date -- deleted B's file:
+        # B ran on believing it held the account, with no lock on disk to stop a
+        # third process. With the guard, breaking and releasing exclude each
+        # other, so B cannot get in between the two statements at all.
+        assert seen["b_took_it"] is False, (
+            "a lock was broken between release()'s ownership check and its unlink")
+        assert not a.owns_the_file()
+        assert not path.exists(), "A released its own lock, which was still its own"
+    finally:
+        b.release()
+
+
+def test_release_gives_up_the_unlink_when_somebody_is_replacing_the_lock(tmp_path):
+    """A guard held by somebody else means the file is already being replaced.
+
+    Deleting it then deletes THEIR lock. The instance stops claiming to hold
+    anything either way; what it must not do is take the file with it.
+    """
+    path = tmp_path / "account.lock"
+    lock = AccountLock(path)
+    lock.acquire()
+    breaker = lock._breaker(timeout=0.5)
+    breaker.acquire()
+    try:
+        lock.release()
+    finally:
+        breaker.release()
+    assert path.exists(), "the lock being replaced was not ours to delete"
+    assert lock._held is False
+    path.unlink()
+
+
+# --------------------------------------------------------------------------
+# A last-resolve stamp in the future
+# --------------------------------------------------------------------------
+def test_a_last_resolve_stamp_in_the_future_does_not_refuse_for_ever(tmp_path):
+    """A negative gap is smaller than every minimum, so every resolve was
+    refused until the clock caught up -- while `summary()` reported no freeze at
+    all, so nothing said why.
+
+    `_recent` was given exactly this bound (more than one window ahead is a
+    clock artefact, not a resolve) and the rule was not copied to the gap.
+    """
+    ledger = ResolveLedger(tmp_path / "ledger.json", min_gap=30.0)
+    now = 1_000_000.0
+    ledger.write(LedgerState(date=_today(), resolves=1,
+                             last_resolve_ts=now + 86_400))
+    ledger.check_resolve(now=now)                    # a day ahead is not a gap
+
+    # Inside one gap ahead still counts: that is the closed direction.
+    ledger.write(LedgerState(date=_today(), resolves=1,
+                             last_resolve_ts=now + 5))
+    with pytest.raises(BudgetExhausted):
+        ledger.check_resolve(now=now)
+
+
+# --------------------------------------------------------------------------
+# Process identity where there is no /proc
+# --------------------------------------------------------------------------
+def test_a_platform_without_proc_has_no_opinion_about_a_pid(monkeypatch):
+    """macOS has no `/proc`, so `open("/proc/<pid>/stat")` raises
+    `FileNotFoundError` for every pid alive -- which read as "definitely gone".
+    `_is_stale` then broke the lock of a run that was still working, and two
+    writers went at one account. `None` is what this function has for "this
+    machine will not say", and that is the honest answer here.
+    """
+    import resolve as resolvemod
+
+    monkeypatch.setattr(resolvemod.sys, "platform", "darwin")
+    monkeypatch.setattr(resolvemod.os.path, "isdir", lambda p: False)
+    assert resolvemod._process_identity(os.getpid()) is None
+
+
+def test_a_pid_that_is_gone_where_proc_exists_is_still_reported_gone(monkeypatch):
+    """The other half: where `/proc` exists, a missing entry still means gone."""
+    import resolve as resolvemod
+
+    monkeypatch.setattr(resolvemod.sys, "platform", "linux")
+    monkeypatch.setattr(resolvemod.os.path, "isdir", lambda p: p == "/proc")
+    assert resolvemod._process_identity(999_999_999) == ""
+
+
+# --------------------------------------------------------------------------
+# A state directory that cannot exist is this module's own refusal
+# --------------------------------------------------------------------------
+def test_a_state_path_that_cannot_be_created_is_not_a_raw_oserror(tmp_path):
+    """`HistoryLog` wrapped its `mkdir` and these two were left bare, so a
+    `TELEGRAM_RESEARCH_STATE` pointing at a file answered from a CONSTRUCTOR
+    with a raw `FileNotFoundError`/`NotADirectoryError` -- out of modules that
+    promise only their own types."""
+    import resolve as resolvemod
+
+    a_file = tmp_path / "notadir"
+    a_file.write_text("x", encoding="utf-8")
+    with pytest.raises(resolvemod.LedgerWriteFailed):
+        ResolveLedger(a_file / "state" / "ledger.json")
+    with pytest.raises(AccountBusy):
+        AccountLock(a_file / "state" / "account.lock")
+
+
+# --------------------------------------------------------------------------
+# A guard is waited out for longer than it takes to go stale
+# --------------------------------------------------------------------------
+def test_the_wait_on_every_write_guard_outlives_its_own_staleness(tmp_path):
+    """The inversion, stated as the invariant it breaks.
+
+    Ten seconds of waiting against sixty seconds of "this guard is dead" means a
+    writer killed mid-write blocks the file for a full minute while every
+    attempt to use it gives up after ten -- one turn short of being allowed to
+    clear it, and burning wall clock after the account calls have already been
+    paid for. `config` owns both numbers so the two cannot drift apart again.
+    """
+    import account as accountmod
+
+    ledger_guard = ResolveLedger(tmp_path / "ledger.json")._guard()
+    history_guard = accountmod.HistoryLog(tmp_path / "history.json")._guard()
+    break_guard = AccountLock(tmp_path / "account.lock")._breaker()
+    for guard in (ledger_guard, history_guard, break_guard):
+        assert guard.timeout > guard.stale_after, guard.label
+        assert guard.stale_after == configmod.GUARD_STALE_AFTER, guard.label
+        assert guard.timeout == configmod.GUARD_TIMEOUT, guard.label
+
+
+def test_a_dead_ledger_guard_is_broken_rather_than_waited_out(tmp_path):
+    """Behavioural, and the age is chosen to tell the two settings apart: 30 s
+    is younger than the old threshold of 60 and older than the new one of 20, so
+    before the repair this refused after ten seconds of waiting and now it
+    clears the corpse and writes."""
+    path = tmp_path / "ledger.json"
+    ledger = ResolveLedger(path)
+    corpse = path.with_name(path.name + ".rmw")
+    corpse.write_text("1 0 dead\n", encoding="utf-8")
+    old = time.time() - 30
+    os.utime(corpse, (old, old))
+
+    ledger.record_resolve("tdlibchat")
+    assert ledger.read().resolves == 1
+    assert not corpse.exists()
+
+
+def test_a_dead_history_guard_is_broken_rather_than_waited_out(tmp_path):
+    import account as accountmod
+
+    path = tmp_path / "account-history.json"
+    log = accountmod.HistoryLog(path)
+    corpse = path.with_name(path.name + ".rmw")
+    corpse.write_text("1 0 dead\n", encoding="utf-8")
+    old = time.time() - 30
+    os.utime(corpse, (old, old))
+
+    log.record_request()
+    assert log.read()["requests"] == 1
+    assert not corpse.exists()
+
+
+def test_a_dead_break_guard_does_not_make_a_stale_lock_unbreakable(tmp_path):
+    """The account lock's own 1800 s threshold is untouched; what changed is the
+    guard that serialises BREAKING it. A process killed inside a break left a
+    `.break` file that every later break gave up on after two seconds while
+    calling it fresh for thirty -- so a stale account lock could not be broken
+    at all for half a minute, and the whole account path was stopped by a file
+    nobody owned. The 25 s age is between the old threshold and the new one.
+    """
+    lock_path = tmp_path / "account.lock"
+    lock_path.write_text(json.dumps({"owner": "dead", "pid": 999_999,
+                                     "since": "then", "ts": 1.0}),
+                         encoding="utf-8")
+    long_ago = time.time() - 10_000
+    os.utime(lock_path, (long_ago, long_ago))
+
+    corpse = lock_path.with_name(lock_path.name + ".break")
+    corpse.write_text("1 0 dead\n", encoding="utf-8")
+    old = time.time() - 25
+    os.utime(corpse, (old, old))
+
+    lock = AccountLock(lock_path, stale_after=100.0)
+    lock.acquire()
+    try:
+        assert lock.owns_the_file()
+    finally:
+        lock.release()

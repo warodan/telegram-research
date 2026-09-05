@@ -11,8 +11,8 @@ resolved by the block at the top of `SKILL.md`. The interpreter comes first and 
 ## Every command prints JSON
 
 The program performs acts; you make the judgements. Every subcommand prints JSON, on the way out and on the
-way down — **with one hole worth knowing**: a refusal argparse makes for itself (an unknown flag, `--run` where
-it is not accepted, `--max-requests 0`) exits 2 with the usage on stderr and **zero bytes on stdout**, so a
+way down — **with one hole worth knowing**: a refusal argparse makes for itself (an unknown flag, or `--run`
+where it is not accepted) exits 2 with the usage on stderr and **zero bytes on stdout**, so a
 caller parsing stdout gets an empty string rather than an error object. Global flags go **before** the
 subcommand: `--root <dir>` · `--run <run-dir>` · `--max-requests <n>`;
 `--run` is also accepted after it on the five fetching commands (`verify`, `discover`, `search`, `history`,
@@ -24,7 +24,7 @@ subcommand: `--root <dir>` · `--run <run-dir>` · `--max-requests <n>`;
 | command | positional | flags that change the result |
 | --- | --- | --- |
 | `selftest` | — | `--probes` |
-| `newrun` | — | `--question` (or `--brief`) `--topic` `--depth quick\|normal\|deep` `--lang` `--geo` `--since` `--until` `--seed-source`\* `--seed-query`\* `--max-rounds` `--min-new-posts` `--caller user\|agent` |
+| `newrun` | — | `--question` (or `--brief`) `--topic` (**`general`**) `--depth quick\|normal\|deep` (**`normal`**) `--lang` `--geo` `--since` `--until` `--seed-source`\* `--seed-query`\* `--max-rounds` `--min-new-posts` `--caller user\|agent` (**`user`**) |
 | `verify` | `usernames…` | `--write` `--found-via` (**`manual`**) `--lang` `--geo` `--min-channel-members` (100) `--min-group-members` (50) `--probe-preview` `--save-to` |
 | `discover` | — | `--lyzem-query` `--lyzem-kind`\* (default **groups, channels, messages**; `all` and `bots` also accepted) `--account-query` `--from-file`\* `--text` `--found-via` (**`web`**) `--snippets-to` `--save-to` |
 | `queries` | `<run> start\|record\|accept\|show` | `--query`\* `--posts` `--top` (25) `--term` `--gloss` |
@@ -39,6 +39,12 @@ subcommand: `--root <dir>` · `--run <run-dir>` · `--max-requests <n>`;
 
 `*` marks a repeatable flag. `--limit` and `--top` refuse `0` and negatives at exit 7: Python slices a negative
 bound as "all but the last N", so a listing would drop rows while `count` still reported the true total.
+`--max-requests` refuses the same way, plus anything that is not a whole number. **Four more refusals happen
+before a request is paid for**, all at exit 7: `--before` under 1 and `--until-id` under 0 (both would go into
+the URL as written and spend the GET), `--id` under 1, and `--snippets-to` pointing at a file that already
+exists — nothing here overwrites somebody's file to save a fetch. And a run folder is never reused: `newrun`
+claims its name by creating the directory, so an empty folder left by a killed `newrun` stays where it is and
+the next run takes the next name.
 
 ## Exit codes
 
@@ -55,8 +61,9 @@ bound as "all but the last N", so a listing would drop rows while `count` still 
    for a reason with no name of its own)
 ```
 
-**A 9 from `registry` is not a bug report.** A registry holding one damaged line refuses every read at 9, and
-`registry compact --force` is the single command that gets past it — the damaged file is kept as
+**A 9 from `registry` is not a bug report.** A registry holding one damaged line makes `compact` refuse at 9;
+`stats`, `list` and `get` answer and name the line in `corrupt_lines` / `damaged_lines_unattributed`.
+`registry compact --force` is the single command that gets past the refusal — the damaged file is kept as
 `<registry>.bak`. That is the third thing `--force` does, and the only one of the three that is not exit 10.
 
 **1 is never produced, and that is load-bearing.** The interpreter returns 1 for an uncaught exception, so a
@@ -146,7 +153,9 @@ parse failure.
 
 **Before believing a thin result**, read `dropped` and `silent_cuts` on `discover` (a filtered candidate is
 named with its reason; a page short for a reason other than a thin index says so), `type_corrections` on
-`verify`, `account_calls` / `resolves` / `peer_refreshed` on a group `search`, `mismatched_ids` on `group` (a
+`verify`, `account_calls` / `resolves` / `peer_refreshed` on a group `search`, `unreadable_ids` on `group` (a
+page that came back carrying no message this parser could read — a login wall or a front end that moved, and
+never the same fact as an empty id), `mismatched_ids` on `group` (a
 page that answered for another id or another peer — unlike `missing_ids`, that one is not ordinary), and
 `posts_suppressed_as_duplicates` on the three reading commands. `posts_banked` is not an ordinary field: it
 appears only when `search` or `history` goes down mid-walk, and says how many posts survived the fall.
@@ -190,8 +199,8 @@ and their count is a property of the folder, not a target; `errors=0` is the thi
 
 `~/.telegram-research/` (or wherever `TELEGRAM_RESEARCH_STATE` points) holds `sources.jsonl` — the shared
 source registry — `resolve-ledger.json`, `account.lock`, `peers.json`, `account-history.json`, `pace/`, and
-the journals that sit beside them: `resolve-ledger.json.freezes.jsonl`, `account.lock.broken.jsonl`,
-`sources.jsonl.bak`.
+the journals that sit beside them: `resolve-ledger.json.freezes.jsonl`,
+`account-history.json.freezes.jsonl`, `account.lock.broken.jsonl`, `sources.jsonl.bak`.
 
 ## Environment variables
 
@@ -240,12 +249,16 @@ the command refuses at exit **7**. The dry run is a Python-API mode (`AccountSes
 simulates its own ceilings for `resolve`, `getHistory` and `join_group` — `contacts.search` and
 `messages.search` answer "this call would go through" without consulting the ceiling at all.
 
-## `budget`: what has been spent, and whether resolving is frozen
+## `budget`: what has been spent, and whether the account is frozen
 
-`tg.py budget` says what has been spent today and whether resolving is frozen. It makes no network call and
+`tg.py budget` says what has been spent today and whether the account is frozen. **There are two freezes and
+it reports both**: `ledger` is the resolve ledger, `history` is the history log, and the top-level `frozen` is
+true when either one is. The history freeze is the one a command line earns, because `getHistory`,
+`contacts.search` and `messages.search` all gate on it while `resolveUsername` is off every ordinary path.
+`--unfreeze` lifts both. It makes no network call and
 touches no credential, so it is always safe to ask, and it exits **7** with `ok: false` when the ledger cannot
 be read rather than reporting a cheerful zero about a file it could not open. `--unfreeze --reason "..."` lifts
-a freeze and then appends what it lifted to `<ledger>.freezes.jsonl`; that order is deliberate — a journal that
+a freeze and then appends what it lifted to `<ledger>.freezes.jsonl` and to the history log's own journal; that order is deliberate — a journal that
 cannot be written does not un-lift a freeze the caller asked for — and its price is `recorded: false` in the
 answer, meaning the freeze is gone and the decision is now unaudited. **Read that field.** The command exists
 for a freeze that was never Telegram's (a wrong clock, a test) and cannot tell that from a real one. **It is

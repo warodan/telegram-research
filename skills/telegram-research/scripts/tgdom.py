@@ -34,6 +34,28 @@ VOID = {
 # sentence, and breaking the line around one would corrupt ordinary text.
 BLOCK_TAGS = ("br", "div", "p", "pre", "blockquote")
 
+# Elements whose contents are code, not words. `handle_data` records them like
+# any other text node -- the DOM stays faithful to the document -- but a caller
+# asking a node for its TEXT is asking what the page says, and a `<script>` in
+# the subtree answered with the page's JavaScript: `_class_text` on a landing
+# card returned the card's prose welded to a var declaration, and a post whose
+# body carried a widget script quoted it verbatim.
+NO_TEXT_TAGS = ("script", "style")
+
+
+class _BlockOpen:
+    """Marker: emit a newline here IF the line built so far is still open.
+
+    The decision depends on what has already been collected, so it cannot be
+    made when the child is queued -- only when the traversal reaches it. See
+    `Node._text_into`, which is a stack rather than a recursion.
+    """
+
+    __slots__ = ()
+
+
+_BLOCK_OPEN = _BlockOpen()
+
 
 def _open_line(parts: list[str]) -> bool:
     """Is there text before this point that a block would otherwise weld to?"""
@@ -65,11 +87,23 @@ class Node:
         return name in self.classes
 
     def walk(self):
-        """Every Node in this subtree, self first."""
-        yield self
-        for child in self.children:
-            if isinstance(child, Node):
-                yield from child.walk()
+        """Every Node in this subtree, self first, in document order.
+
+        An explicit stack, not recursion. The depth of this tree is the depth of
+        a body that came off the network, and `yield from` spends a frame per
+        level: a document nested 1 500 deep raised `RecursionError` out of
+        `tgparse.parse_preview`, i.e. out of a public entry point, where a page
+        this module cannot read has to be reported rather than crash the run.
+        Telegram's own markup is shallow -- that is the point: nothing here may
+        depend on a remote server keeping it that way.
+        """
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            yield node
+            stack.extend(
+                child for child in reversed(node.children) if isinstance(child, Node)
+            )
 
     def find_all(self, cls: str = None, tag: str = None, attr: str = None) -> list["Node"]:
         out = []
@@ -117,19 +151,36 @@ class Node:
         return "\n".join(lines).strip()
 
     def _text_into(self, parts: list[str], block_tags) -> None:
-        for child in self.children:
-            if isinstance(child, str):
-                parts.append(child)
-            else:
-                if child.tag == "br":
+        """Collect this subtree's text, iteratively -- see `walk` for why.
+
+        The stack holds three kinds of item and pops them in document order: a
+        string to append verbatim, a `_BLOCK_OPEN` marker whose newline depends
+        on what has been collected by the time it is reached, and a Node still
+        to be expanded.
+        """
+        stack: list = [self]
+        while stack:
+            item = stack.pop()
+            if item is _BLOCK_OPEN:
+                if _open_line(parts):
                     parts.append("\n")
-                    continue
-                block = child.tag in block_tags
-                if block and _open_line(parts):
-                    parts.append("\n")
-                child._text_into(parts, block_tags)
-                if block:
-                    parts.append("\n")
+                continue
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            batch: list = []
+            for child in item.children:
+                if isinstance(child, str):
+                    batch.append(child)
+                elif child.tag == "br":
+                    batch.append("\n")
+                elif child.tag in NO_TEXT_TAGS:
+                    continue            # code, not words -- see NO_TEXT_TAGS
+                elif child.tag in block_tags:
+                    batch.extend((_BLOCK_OPEN, child, "\n"))
+                else:
+                    batch.append(child)
+            stack.extend(reversed(batch))
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         cls = " ".join(self.classes)

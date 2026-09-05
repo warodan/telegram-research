@@ -34,6 +34,7 @@ if str(SCRIPTS) not in sys.path:
 import config as config_module  # noqa: E402
 import querycraft  # noqa: E402
 import account as account_module  # noqa: E402
+from fakes import FakeTransport  # noqa: E402
 import registry as registry_module  # noqa: E402
 import resolve as resolve_module  # noqa: E402
 import tg  # noqa: E402
@@ -60,8 +61,8 @@ SELFTEST_PROBES = (
     "C01-landing-durov.html", "A18-landing-tdlibchat.html",
     "C02-landing-nonexistent.html", "A01-s-durov.html",
     "A09-s-Astana_motoriders.html", "C15-s-durov-q-rare.html",
-    "C26-embed-hanoi-29320.html", "C08-embed-tdlibchat-50000.html",
-    "C10-embed-tdlibchat-10000.html", "C16-embed-hanoi-1000.html",
+    "C26-embed-birding-29320.html", "C08-embed-tdlibchat-50000.html",
+    "C10-embed-tdlibchat-10000.html", "C16-embed-birding-1000.html",
 )
 
 
@@ -415,10 +416,20 @@ def test_a_max_requests_that_is_not_a_ceiling_is_a_usage_error(cli, site, value)
     wrapped and ten fetches ran with nothing able to stop them. `0` was dropped
     as falsy, so an operator who typed 0 meaning "spend nothing" was given the
     brief's 133/400/800. Neither said a word in the JSON.
+
+    And the refusal itself is JSON now. The check was an argparse `type=`,
+    which exits 2 with **zero bytes on stdout** -- against the one promise this
+    module makes about every subcommand. A subagent reading an empty line
+    cannot tell a refused flag from a command that found nothing, and this is
+    the flag most likely to be typed wrong. `row_limit` says so in its own
+    docstring and refuses through `UsageError` for exactly this reason.
     """
-    with pytest.raises(SystemExit) as exit_info:
-        cli("--max-requests", value, "search", "durov", "--query", "bitcoin")
-    assert exit_info.value.code == tg.EXIT_USAGE
+    result = cli("--max-requests", value, "search", "durov", "--query", "bitcoin")
+    assert result.exit_code == tg.EXIT_OPERATOR, result.stdout
+    assert result.json is not None, repr(result.stdout)
+    assert result.json["ok"] is False
+    assert result.json["error_type"] == "UsageError"
+    assert "--max-requests" in result.json["error"]
     assert not site.requested, "a request was spent before the flag was checked"
 
 
@@ -790,10 +801,10 @@ def test_discover_says_what_it_threw_away(cli, tmp_path):
     subscribers, so for any question about Telegram itself the obvious source
     was removed without a word.
     """
-    result = cli("discover", "--text", "смотри @telegram и @hanoi_chats")
+    result = cli("discover", "--text", "смотри @telegram и @birding_chats")
     assert result.exit_code == tg.EXIT_OK, result.stdout
     names = [c["username"].lower() for c in result.json["candidates"]]
-    assert "hanoi_chats" in names
+    assert "birding_chats" in names
     assert "telegram" not in names
     assert result.json["dropped"], "a candidate was dropped with no record of it"
     assert any("telegram" in reason for reason in result.json["dropped"])
@@ -1500,6 +1511,82 @@ def test_budget_unfreeze_clears_a_real_freeze_end_to_end(cli, tmp_path):
     assert cli("budget").json["frozen"] is False
 
 
+def test_a_non_numeric_request_ceiling_is_refused_in_json(cli):
+    """`--max-requests abc` was argparse's refusal: exit 2, empty stdout.
+
+    The flag's own check catches 0 and negatives, but `type=int` ran first and
+    argparse never prints JSON -- so the caller parsing stdout got an empty
+    string for a mistyped ceiling and an error object for a zero one.
+    """
+    result = cli("--max-requests", "abc", "verify", "durov")
+    assert result.exit_code == tg.EXIT_OPERATOR, result.stdout
+    assert result.json["error_type"] == "UsageError"
+    assert "whole number" in result.json["error"]
+
+
+def test_budget_answers_even_when_the_history_state_is_damaged(cli, tmp_path):
+    """`budget` is the command SKILL.md calls always safe to ask.
+
+    A damaged `account-history.json` raised out of the new history block and
+    came back as exit 5, which the table reserves for "the surface answered
+    badly" -- about a file that never left this disk. The ledger's own
+    unreadable verdict has always been a field, and so is this one now.
+    """
+    state = Path(cli("budget").json["path"]).parent
+    (state / account_module.HISTORY_STATE_FILE).write_text("{ broken",
+                                                           encoding="utf-8")
+
+    result = cli("budget")
+    assert result.exit_code == tg.EXIT_OPERATOR, result.stdout
+    assert result.json["ok"] is False
+    assert result.json["readable"] is False
+    assert result.json["history"]["readable"] is False
+
+
+def test_selftest_names_the_probe_that_is_missing(cli, tmp_path):
+    """A corpus short one page is an operator error, not a crash.
+
+    `selftest` is the command whose whole job is a clear verdict about the
+    parsers, and it read its ten pages straight off disk: point `--probes` at a
+    directory holding nine of them and it answered with a bare
+    FileNotFoundError and a traceback.
+    """
+    short = tmp_path / "nine-pages"
+    short.mkdir()
+    (short / "A01-s-durov.html").write_text("<html></html>", encoding="utf-8")
+
+    result = cli("selftest", "--probes", str(short))
+    assert result.exit_code == tg.EXIT_OPERATOR, result.stdout
+    assert result.json["error_type"] == "UsageError"
+    assert "C01-landing-durov.html" in result.json["error"]
+
+
+def test_budget_reports_and_lifts_the_history_freeze_too(cli, tmp_path):
+    """The freeze a CLI run can actually earn is the history one.
+
+    `resolveUsername` is off every ordinary path, so the resolve ledger is the
+    freeze that almost never fires; `getHistory`, `contacts.search` and
+    `messages.search` all gate on the history log instead. Reading only the
+    ledger, `budget` answered `frozen: false` while all three account commands
+    refused -- from the command SKILL.md calls the safety check -- and
+    `--unfreeze` had nothing to lift.
+    """
+    state = Path(cli("budget").json["path"]).parent
+    log = account_module.HistoryLog(state / account_module.HISTORY_STATE_FILE)
+    log.freeze(3600, "FloodWait 3600 on getHistory")
+
+    frozen = cli("budget")
+    assert frozen.json["frozen"] is True, frozen.stdout
+    assert frozen.json["history"]["history_frozen"] is True
+    assert frozen.json["ledger"]["frozen"] is False, "the resolve ledger is clean"
+
+    lifted = cli("budget", "--unfreeze", "--reason", "the clock was wrong")
+    assert lifted.exit_code == tg.EXIT_OK, lifted.stdout
+    assert lifted.json["was_frozen"] is True
+    assert lifted.json["frozen"] is False
+    assert cli("budget").json["frozen"] is False
+
+
 # ==========================================================================
 # Found by re-testing the repaired tree
 # ==========================================================================
@@ -1700,7 +1787,7 @@ def lyzem_page(select: str = LYZEM_SELECT, *, results: int = 50,
     """
     blocks = "".join(
         f'<div class="search-result"><a href="https://t.me/chan{i}/{i}">'
-        f"чат про аренду {i}</a><span>аренда квартиры в Ханое {i}</span></div>"
+        f"чат про аренду {i}</a><span>аренда квартиры в центре {i}</span></div>"
         for i in range(1, results + 1)
     )
     return f"<html><body>{select}<div>{claims} results</div>{blocks}</body></html>"
@@ -1921,7 +2008,7 @@ def test_group_names_the_ids_that_answered_nothing_instead_of_dropping_them(
     """An id that answered nothing is a fact, and it costs the same GET as a hit.
 
     `SKILL.md` says twice that a group read costs one GET **per id ASKED**, not
-    per message found -- measured on `hanoi_chats`, 175 ids for 3 messages, a
+    per message found -- measured on `birding_chats`, 175 ids for 3 messages, a
     1.7 % hit rate. So a command that returns one message out of three ids has
     to say which two were empty: `found: 1` alone reads as a cheap read, and
     dropping the empty ids hides both the cost and the fact that those ids were
@@ -1939,6 +2026,32 @@ def test_group_names_the_ids_that_answered_nothing_instead_of_dropping_them(
     assert result.json["missing_ids"] == [10001, 10002], result.json
     assert result.json["mismatched_ids"] == []
     assert result.json["requests"] == 3, "an empty id costs the same GET as a hit"
+
+
+def test_a_page_that_could_not_be_read_is_not_reported_as_an_empty_id(
+    cli, site, probe
+):
+    """A page nobody could read is not evidence that the id holds nothing.
+
+    `?embed=1` has three answers, not two: the message, Telegram's own "post
+    not found", and a body this reader cannot make a message out of -- a login
+    wall, or a front end that moved. Folding the third into `missing_ids` is
+    how a talking group gets reported as a finished history, because the walk
+    stops on empty ids. So the third answer gets its own list.
+    """
+    # Long enough not to trip the short-body stop signal: this is a full page
+    # that simply carries no message the reader knows how to parse.
+    wall = ("<!DOCTYPE html><html><head><title>Telegram</title></head><body>"
+            + "<div class='tgme_page'>Please log in to view this.</div>" * 40
+            + "</body></html>")
+    site.add("https://t.me/tdlibchat/10001?embed=1", wall)
+    site.add(EMBED, probe("C10-embed-tdlibchat-10000.html"))
+
+    result = cli("group", "tdlibchat", "--id", 10000, "--id", 10001)
+    assert result.exit_code == tg.EXIT_OK, result.stdout
+    assert result.json["found"] == 1
+    assert result.json["unreadable_ids"] == [10001], result.json
+    assert result.json["missing_ids"] == [], "an unread page is not a proven empty id"
 
 
 def test_a_stopped_group_read_banks_what_answered_before_the_stop(cli, site, probe,
@@ -1960,9 +2073,7 @@ def test_a_stopped_group_read_banks_what_answered_before_the_stop(cli, site, pro
 
     The assertion is written against `site.requested` rather than against the
     literal 3, because the rule is "every act that left the machine is counted"
-    and that is the thing worth pinning. `SKILL.md`'s own live measurement of
-    the same shape: `hanoi_chats`, `ids_tried: 11`, `requests: 11`, `found: 1`,
-    `hit_rate: 0.0909`.
+    and that is the thing worth pinning.
     """
     site.add(EMBED, probe("C10-embed-tdlibchat-10000.html"))
     site.add("https://t.me/tdlibchat/10001?embed=1", "rate limited", status=429)
@@ -2023,12 +2134,12 @@ def test_search_and_history_say_when_a_page_parsed_nothing(cli, site, probe):
 # ==========================================================================
 # One command instead of two. `search` used to refuse a group outright (exit 6,
 # "read them with `group`") and send the caller to a walk that could not search
-# at all: measured on `hanoi_chats`, 200 GETs, 2 messages, 0 of them carrying the
+# at all: measured on `birding_chats`, 200 GETs, 2 messages, 0 of them carrying the
 # word the run was about. The same question through `messages.search` is 1 call
 # and 44 hits, and the peer it needs arrives from `contacts.search` rather than
 # from the resolve that once froze this account for ten hours.
 
-ACCOUNT_PEER = {"username": "hanoi_chats", "id": 1931920118, "access_hash": 77,
+ACCOUNT_PEER = {"username": "birding_chats", "id": 1000000001, "access_hash": 77,
                 "type": "group", "title": "Большой чат | Общение",
                 "participants": 2835, "verified": False, "scam": False}
 
@@ -2065,15 +2176,15 @@ def account_wire(monkeypatch, tmp_path):
         "TELEGRAM_SESSION=1" + "A9zK" * 88 + "\n",
         encoding="utf-8")
     monkeypatch.setenv("TELEGRAM_RESEARCH_ENV", str(env))
-    fake = account_module.FakeTransport()
-    fake.with_contacts("hanoi_chats", [ACCOUNT_PEER])
+    fake = FakeTransport()
+    fake.with_contacts("birding_chats", [ACCOUNT_PEER])
     fake.with_contacts("аренда квартиры недорого", [ACCOUNT_PEER])
-    fake.with_hits(1931920118, "слово", ACCOUNT_HITS, total=2)
+    fake.with_hits(1000000001, "слово", ACCOUNT_HITS, total=2)
     monkeypatch.setattr(tg, "_open_account", lambda cfg: fake)
     return fake
 
 
-def group_in_registry(cli, tmp_path, name="hanoi_chats"):
+def group_in_registry(cli, tmp_path, name="birding_chats"):
     seed_registry(tmp_path, name, type="group", status="alive", found_via="manual")
 
 
@@ -2081,7 +2192,7 @@ def test_search_of_a_group_goes_to_mtproto_and_spends_no_resolve(
     cli, tmp_path, account_wire
 ):
     group_in_registry(cli, tmp_path)
-    result = cli("search", "hanoi_chats", "--query", "слово")
+    result = cli("search", "birding_chats", "--query", "слово")
     assert result.exit_code == tg.EXIT_OK, result.stdout
     assert result.json["surface"] == "mtproto"
     assert account_wire.resolve_calls == [], "the group search resolved a name"
@@ -2091,7 +2202,7 @@ def test_search_of_a_group_goes_to_mtproto_and_spends_no_resolve(
     row = result.json["results"][0]
     assert row["found"] == 2 and row["server_total"] == 2 and row["complete"] is True
     assert [m["id"] for m in row["messages"]] == [28569, 15597]
-    assert row["messages"][0]["url"] == "https://t.me/hanoi_chats/28569"
+    assert row["messages"][0]["url"] == "https://t.me/birding_chats/28569"
     assert row["messages"][0]["found_by"] == "слово"
 
 
@@ -2102,8 +2213,8 @@ def test_the_second_question_about_a_group_costs_one_call_not_two(
     buys: the access hash does not expire while the login lives, so looking the
     group up is a cost paid once for the life of the session."""
     group_in_registry(cli, tmp_path)
-    assert cli("search", "hanoi_chats", "--query", "слово").json["account_calls"] == 2
-    second = cli("search", "hanoi_chats", "--query", "слово")
+    assert cli("search", "birding_chats", "--query", "слово").json["account_calls"] == 2
+    second = cli("search", "birding_chats", "--query", "слово")
     assert second.json["account_calls"] == 1, second.stdout
     assert len(account_wire.contacts_calls) == 1, "the peer was looked up twice"
 
@@ -2115,10 +2226,10 @@ def test_a_group_search_says_when_it_returned_less_than_the_server_holds(
     know -- it caps silently and 21 hits got reported as what a channel said
     about a subject, out of a channel that used the word in 32 of its last 60
     posts. Here the server states the total, so silence about it is a choice."""
-    account_wire.with_hits(1931920118, "слово", ACCOUNT_HITS, total=44)
+    account_wire.with_hits(1000000001, "слово", ACCOUNT_HITS, total=44)
     monkeypatch.setattr(tg, "MTPROTO_PAGE", 2)
     group_in_registry(cli, tmp_path)
-    result = cli("search", "hanoi_chats", "--query", "слово", "--max-pages", 1)
+    result = cli("search", "birding_chats", "--query", "слово", "--max-pages", 1)
     row = result.json["results"][0]
     assert row["found"] == 2 and row["server_total"] == 44
     assert row["complete"] is False
@@ -2135,7 +2246,7 @@ def test_a_group_search_with_the_live_switch_off_reads_no_credential(
     monkeypatch.delenv("TELEGRAM_RESEARCH_ALLOW_LIVE", raising=False)
     monkeypatch.setenv("TELEGRAM_RESEARCH_ENV", str(tmp_path / "nowhere.env"))
     group_in_registry(cli, tmp_path)
-    result = cli("search", "hanoi_chats", "--query", "слово")
+    result = cli("search", "birding_chats", "--query", "слово")
     assert result.exit_code == tg.EXIT_OPERATOR, result.stdout
     assert "TELEGRAM_RESEARCH_ALLOW_LIVE" in result.json["error"]
     assert "nowhere.env" not in result.json["error"], \
@@ -2162,14 +2273,14 @@ def test_the_posts_a_group_search_found_land_in_the_run(cli, tmp_path, account_w
     group_in_registry(cli, tmp_path)
     root = Path(cli("--root", tmp_path, "newrun", "--question", "слово",
                     "--topic", "t").json["run"])
-    result = cli("--run", root, "search", "hanoi_chats", "--query", "слово")
+    result = cli("--run", root, "search", "birding_chats", "--query", "слово")
     assert result.exit_code == tg.EXIT_OK, result.stdout
     rows = [json.loads(line) for line
             in (root / "posts.jsonl").read_text(encoding="utf-8").splitlines() if line]
     assert [r["id"] for r in rows] == [28569, 15597]
-    assert rows[0]["username"] == "hanoi_chats" and rows[0]["found_by"] == "слово"
+    assert rows[0]["username"] == "birding_chats" and rows[0]["found_by"] == "слово"
     # And the same de-duplication every other route gets, keyed (username, id).
-    again = cli("--run", root, "search", "hanoi_chats", "--query", "слово")
+    again = cli("--run", root, "search", "birding_chats", "--query", "слово")
     assert again.json["posts_suppressed_as_duplicates"] == 2
     assert len((root / "posts.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 2
 
@@ -2196,7 +2307,7 @@ def test_a_stale_cached_hash_is_repaired_inside_the_command(
     cache.put([stale], _live_fingerprint())
     account_wire.stale_peer(999)
 
-    result = cli("search", "hanoi_chats", "--query", "слово", "--max-pages", 1)
+    result = cli("search", "birding_chats", "--query", "слово", "--max-pages", 1)
     assert result.exit_code == tg.EXIT_OK, result.stdout
     assert result.json["peer_refreshed"] is True
     assert result.json["results"][0]["found"] == 2, result.stdout
@@ -2265,7 +2376,7 @@ def test_discover_through_the_account_costs_one_call_and_no_resolve(
     assert result.json["account"]["resolves"] == 0
     assert result.json["account"]["peers_cached"] == 1
     names = [c["username"] for c in result.json["candidates"]]
-    assert names == ["hanoi_chats"]
+    assert names == ["birding_chats"]
     assert result.json["candidates"][0]["channels"] == ["account"]
     # The blind spot is stated wherever the channel is used: it never sees
     # inside a message, which is why it runs beside the other two.
@@ -2316,7 +2427,7 @@ def test_a_peer_that_stays_stale_is_refused_rather_than_looked_up_for_ever(
     # Both the cached hash AND the one the search box hands back are refused.
     account_wire.stale_peer(999).stale_peer(ACCOUNT_PEER["access_hash"])
 
-    result = cli("search", "hanoi_chats", "--query", "слово")
+    result = cli("search", "birding_chats", "--query", "слово")
     assert result.exit_code == tg.EXIT_FETCH_FAILED, result.stdout
     assert result.json["error_type"] == "PeerUnusable"
     # One refused search, one look-up, one refused retry. Never a second loop.
@@ -2337,19 +2448,19 @@ def test_history_of_a_group_reads_it_through_the_account_in_one_call(
         {"id": 29327, "date": "2026-08-22T05:00:00+00:00", "text": "Hi",
          "author_id": 1, "author_name": None, "author_username": None,
          "reply_to_id": None, "via": "mtproto"},
-        {"id": 29201, "date": "2026-08-08T05:00:00+00:00", "text": "педикюр в Ханое",
+        {"id": 29201, "date": "2026-08-08T05:00:00+00:00", "text": "погода на выходные",
          "author_id": 2, "author_name": None, "author_username": None,
          "reply_to_id": None, "via": "mtproto"},
     ])
     group_in_registry(cli, tmp_path)
-    result = cli("history", "hanoi_chats", "--max-pages", 1)
+    result = cli("history", "birding_chats", "--max-pages", 1)
     assert result.exit_code == tg.EXIT_OK, result.stdout
     assert result.json["surface"] == "mtproto"
     assert result.json["found"] == 2
     assert result.json["resolves"] == 0 and account_wire.resolve_calls == []
     # One call for the peer, one for the page.
     assert result.json["account_calls"] == 2
-    assert result.json["messages"][0]["url"] == "https://t.me/hanoi_chats/29327"
+    assert result.json["messages"][0]["url"] == "https://t.me/birding_chats/29327"
     # A `history` walk has no query behind it, so `found_by` must stay null --
     # the same promise the channel walk has always kept.
     assert result.json["messages"][0]["found_by"] is None
@@ -2365,11 +2476,11 @@ def test_a_bounded_group_history_does_not_move_the_cursor(cli, tmp_path, account
              "via": "mtproto"} for i in range(29327, 29327 - 100, -1)]
     account_wire.with_history(ACCOUNT_PEER["id"], rows)
     group_in_registry(cli, tmp_path)
-    result = cli("history", "hanoi_chats", "--max-pages", 1, "--write")
+    result = cli("history", "birding_chats", "--max-pages", 1, "--write")
     assert result.exit_code == tg.EXIT_OK, result.stdout
     assert result.json["cursor_written"] is False
     assert result.json["cursor_withheld_reason"]
-    assert get_source(cli, "hanoi_chats").get("max_id_seen") is None
+    assert get_source(cli, "birding_chats").get("max_id_seen") is None
 
 
 @pytest.mark.parametrize("command", ["search", "history"])
@@ -2384,8 +2495,105 @@ def test_a_page_ceiling_of_zero_is_refused_on_every_surface(
     """
     group_in_registry(cli, tmp_path)
     args = ["--query", "слово"] if command == "search" else []
-    result = cli(command, "hanoi_chats", *args, "--max-pages", 0)
+    result = cli(command, "birding_chats", *args, "--max-pages", 0)
     assert result.exit_code == tg.EXIT_USAGE, result.stdout
     assert result.json["error_type"] == "NothingAsked"
     assert account_wire.contacts_calls == [] and account_wire.search_calls == []
     assert account_wire.history_calls == [], "a refusal spent an account call"
+
+
+# ==========================================================================
+# The parser as an operator meets it
+# ==========================================================================
+def test_every_subcommand_is_listed_in_the_top_level_help():
+    """`registry` was added with no `help=`, and argparse lists only the
+    subcommands that have one: the command that repairs and inspects the source
+    log was the single one missing from `tg.py --help`."""
+    parser = tg.build_parser()
+    actions = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert len(actions) == 1
+    sub = actions[0]
+    # The name is in the usage line either way. What decides whether it gets a
+    # LINE of its own, with a sentence saying what it does, is `help=`:
+    # argparse only records a choice in `_choices_actions` when it has one.
+    described = {action.dest for action in sub._choices_actions}
+    assert set(sub.choices) - described == set(), (
+        "these subcommands have no help= and so appear nowhere in the list "
+        f"`tg.py --help` prints: {sorted(set(sub.choices) - described)}")
+    for action in sub._choices_actions:
+        assert action.help, action.dest
+
+
+def test_the_root_help_describes_the_flag_and_not_its_own_history():
+    """"...which used to decide it" is a note about a repair, not a description
+    of what the flag does. Help text is read by somebody deciding what to type."""
+    # Collapsed, because argparse rewraps the text it prints.
+    help_text = " ".join(tg.build_parser().format_help().split())
+    assert "used to decide it" not in help_text
+    assert "the project this skill is installed in" in help_text
+
+
+def test_the_parser_adds_one_argument_per_statement():
+    """`p.add_argument(...), p.add_argument(...)` builds a tuple and throws it
+    away. It works, it reads as a typo, and it hides the second flag from
+    anybody scanning the parser for one."""
+    source = (SCRIPTS / "tg.py").read_text(encoding="utf-8")
+    offenders = [n for n, line in enumerate(source.splitlines(), 1)
+                 if "), p.add_argument(" in line]
+    assert offenders == [], offenders
+
+
+def test_history_refuses_a_before_that_is_not_a_message_id(cli, site):
+    """`--before` and `--until-id` went into the URL exactly as typed, while
+    `--id` and `--max-pages` next door refuse before the wire. Measured:
+    `--before -5` reached `t.me`, came back with nothing, and cost a paid GET
+    to say so."""
+    refused = cli("history", "durov", "--before", -5)
+    assert refused.exit_code == tg.EXIT_OPERATOR, refused.stdout
+    assert refused.json["error_type"] == "UsageError"
+    assert "--before" in refused.json["error"]
+
+    negative_floor = cli("history", "durov", "--until-id", -1)
+    assert negative_floor.exit_code == tg.EXIT_OPERATOR, negative_floor.stdout
+    assert "--until-id" in negative_floor.json["error"]
+
+    assert not site.requested, "a request was spent before the flags were checked"
+
+
+def test_snippets_to_does_not_overwrite_a_file_that_is_already_there(
+    cli, site, tmp_path
+):
+    """`report` refuses to replace a `report.md` it did not write; this wrote
+    over whatever was at the path with no question and no backup. The obvious
+    way to use the flag -- the same file for a second discovery pass -- lost
+    the first pass's snippets."""
+    site.add(tg.discover_module.lyzem_url("x"), "<html></html>")
+    kept = tmp_path / "snippets.md"
+    kept.write_text("what the first pass found", encoding="utf-8")
+
+    refused = cli("discover", "--lyzem-query", "x", "--snippets-to", kept)
+    assert refused.exit_code == tg.EXIT_OPERATOR, refused.stdout
+    assert str(kept) in refused.json["error"]
+    assert kept.read_text(encoding="utf-8") == "what the first pass found"
+    assert not site.requested, "the paid GET happened before the flag was checked"
+
+
+def test_report_md_is_written_the_way_the_other_artefacts_are(
+    cli, tmp_path, monkeypatch
+):
+    """`report.md` went out through a bare `write_text` while `run.json` and
+    `queries.json` beside it get the write guard and the atomic replace.
+    `write_text` truncates first, so an interrupt here leaves a half-written
+    report on the one file in the folder a human writes by hand."""
+    root = a_run(cli, tmp_path)
+    written: list[str] = []
+    real = config_module.atomic_write_text
+
+    def watched(path, text, **kwargs):
+        written.append(Path(path).name)
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(config_module, "atomic_write_text", watched)
+    assert cli("report", root).exit_code == tg.EXIT_OK
+    assert "report.md" in written, written
+    assert tg.REPORT_PLACEHOLDER in (root / "report.md").read_text(encoding="utf-8")

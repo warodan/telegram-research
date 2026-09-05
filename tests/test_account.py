@@ -41,6 +41,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import account                                  # noqa: E402
+from fakes import FakeTransport                 # noqa: E402
 import config as configmod                      # noqa: E402
 import tgparse                                  # noqa: E402
 from resolve import (                           # noqa: E402
@@ -121,7 +122,7 @@ def make_ledger(cfg, **kw) -> ResolveLedger:
 def make_session(tmp_path, transport=None, *, live=False, cfg=None, ledger=None,
                  options=None, sleeps=None, fingerprint=FP):
     cfg = cfg if cfg is not None else make_cfg(tmp_path)
-    transport = transport if transport is not None else account.FakeTransport()
+    transport = transport if transport is not None else FakeTransport()
     ledger = ledger if ledger is not None else make_ledger(cfg)
     sleeps = [] if sleeps is None else sleeps
     if live:
@@ -241,18 +242,18 @@ def test_transport_protocol_carries_the_reading_operations_and_no_join():
               if callable(value) and not name.startswith("_")}
     assert public == {"resolve_username", "fetch_history",
                       "search_contacts", "search_messages"}
-    assert isinstance(account.FakeTransport(), account.Transport)
+    assert isinstance(FakeTransport(), account.Transport)
 
 
 def test_fake_transport_scripts_all_three_answers():
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     assert fake.resolve_username("tdlibchat")["id"] == 1006503122
     fake.not_found("nobody")
     with pytest.raises(account.PeerNotFound):
         fake.resolve_username("nobody")
-    fake.flood_on("hanoi_chats", 36468)
+    fake.flood_on("birding_chats", 36468)
     with pytest.raises(account.FloodWait) as exc:
-        fake.resolve_username("hanoi_chats")
+        fake.resolve_username("birding_chats")
     assert exc.value.seconds == 36468
 
 
@@ -263,7 +264,7 @@ def test_config_cannot_switch_on_spending(tmp_path):
     """Both merge layers say spend; the outgoing call still carries None."""
     cfg = make_cfg(tmp_path)
     cfg.call_options = {"allow_paid_stars": 5000}          # a config file trying it
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     session = make_session(tmp_path, fake, live=True, cfg=cfg,
                            options={"allow_paid_stars": True})   # a caller trying it
     with session as live:
@@ -282,7 +283,7 @@ def test_forced_value_is_written_after_every_layer():
 
 def test_transport_boundary_refuses_a_hand_built_paid_call():
     """The second gate, for a caller that skipped free_call_options entirely."""
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with pytest.raises(account.PaidCallRefused):
         fake.resolve_username("tdlibchat", options={"allow_paid_stars": 1})
     with pytest.raises(account.PaidCallRefused):
@@ -291,7 +292,7 @@ def test_transport_boundary_refuses_a_hand_built_paid_call():
 
 
 def test_history_call_also_carries_the_forced_value(tmp_path):
-    fake = account.FakeTransport().with_history(7, [{"id": 3, "text": "hi"}])
+    fake = FakeTransport().with_history(7, [{"id": 3, "text": "hi"}])
     session = make_session(tmp_path, fake, live=True, options={"allow_paid_stars": 9})
     with session as live:
         page = live.history(req(), good_peer(peer_id=7))
@@ -303,7 +304,7 @@ def test_history_call_also_carries_the_forced_value(tmp_path):
 # 4. Evidence from the free surface, or no resolve
 # --------------------------------------------------------------------------
 def test_resolve_without_evidence_is_an_exception_not_a_log_line(tmp_path):
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     session = make_session(tmp_path, fake, live=True)
     with session as live:
         with pytest.raises(account.EvidenceRequired):
@@ -319,7 +320,7 @@ def test_resolve_without_evidence_is_an_exception_not_a_log_line(tmp_path):
     {"exists": True, "type": "group", "username": "someoneelse"},
 ])
 def test_weak_evidence_is_refused(tmp_path, evidence):
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     session = make_session(tmp_path, fake, live=True)
     with session as live:
         with pytest.raises(account.EvidenceRequired):
@@ -331,23 +332,25 @@ def test_a_real_peercard_is_accepted_as_evidence(tmp_path):
     """The measured tdlibchat card, straight off the fixture values."""
     card = tgparse.PeerCard(username="tdlibchat", exists=True, type="group",
                             members=16674, online=362)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     session = make_session(tmp_path, fake, live=True)
     with session as live:
-        peer = live.resolve(account.SourceRequest.from_card(card))
+        peer = live.resolve(account.SourceRequest(username=card.username,
+                                                 evidence=card))
     assert peer["id"] == 1006503122
     assert len(fake.resolve_calls) == 1
 
 
 def test_a_channel_never_reaches_the_account_path(tmp_path):
     """Measured: /s/<name> gives a channel 20 messages a page for nothing."""
-    fake = account.FakeTransport().answer_with("durov", 1)
+    fake = FakeTransport().answer_with("durov", 1)
     session = make_session(tmp_path, fake, live=True)
     card = tgparse.PeerCard(username="durov", exists=True, type="channel",
                             members=11110268)
     with session as live:
         with pytest.raises(account.WrongSurface):
-            live.resolve(account.SourceRequest.from_card(card))
+            live.resolve(account.SourceRequest(username=card.username,
+                                               evidence=card))
     assert fake.resolve_calls == []
 
 
@@ -357,7 +360,7 @@ def test_a_channel_never_reaches_the_account_path(tmp_path):
 def test_a_successful_resolve_is_counted(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         live.resolve(req())
     assert ledger.read().resolves == 1
@@ -367,7 +370,7 @@ def test_a_failed_resolve_is_counted_too(tmp_path):
     """Whether Telegram charges less for a miss is not established either way."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().not_found("tdlibchat")
+    fake = FakeTransport().not_found("tdlibchat")
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(account.PeerNotFound):
             live.resolve(req())
@@ -378,7 +381,7 @@ def test_the_check_happens_before_the_call_not_after(tmp_path):
     """A ledger already at its ceiling means the transport is never touched."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg, daily_ceiling=0)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(BudgetExhausted):
             live.resolve(req())
@@ -389,7 +392,7 @@ def test_a_frozen_ledger_from_an_earlier_run_blocks_every_resolve(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
     ledger.freeze(36468, "an earlier run met the wall")
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(ResolveFrozen):
             live.resolve(req())
@@ -402,7 +405,7 @@ def test_the_minimum_gap_pauses_instead_of_refusing(tmp_path):
     ledger = make_ledger(cfg, min_gap=30.0)
     ledger.record_resolve("earlier", ok=True)
     sleeps: list[float] = []
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger,
                       sleeps=sleeps) as live:
         live.resolve(req())
@@ -421,12 +424,12 @@ def test_first_floodwait_stops_every_remaining_resolve(tmp_path):
     """
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport()
-    fake.answer_with("hanoi_chats", 2832).flood_on("tdlibchat", 36468)
+    fake = FakeTransport()
+    fake.answer_with("birding_chats", 2832).flood_on("tdlibchat", 36468)
     requests = [
         req("cached_one", cached_peer=good_peer(peer_id=11)),
         req("tdlibchat"),                          # floods here
-        req("hanoi_chats"),                        # must not be attempted
+        req("birding_chats"),                        # must not be attempted
         req("cached_two", cached_peer=good_peer(peer_id=22)),
     ]
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
@@ -435,7 +438,7 @@ def test_first_floodwait_stops_every_remaining_resolve(tmp_path):
     assert [c["username"] for c in fake.resolve_calls] == ["tdlibchat"]
     assert sorted(report.peers) == ["cached_one", "cached_two"]
     assert sorted(report.from_cache) == ["cached_one", "cached_two"]
-    assert sorted(report.skipped) == ["hanoi_chats", "tdlibchat"]
+    assert sorted(report.skipped) == ["birding_chats", "tdlibchat"]
     assert report.frozen is True
 
     state = ledger.read()
@@ -467,29 +470,29 @@ def test_the_first_floodwait_calls_freeze_and_latches_the_run(tmp_path):
     ledger = UnpersistedFreezeLedger(cfg.ledger_path, daily_ceiling=180,
                                      burst_ceiling=100, burst_window=600,
                                      min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport()
-    fake.answer_with("hanoi_chats", 2832).flood_on("tdlibchat", 36468)
+    fake = FakeTransport()
+    fake.answer_with("birding_chats", 2832).flood_on("tdlibchat", 36468)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
-        report = live.prepare([req("tdlibchat"), req("hanoi_chats")])
+        report = live.prepare([req("tdlibchat"), req("birding_chats")])
 
     assert ledger.freezes == [(36468, "FloodWait on resolve of @tdlibchat")]
     assert [c["username"] for c in fake.resolve_calls] == ["tdlibchat"]
     assert report.frozen is True
-    assert "hanoi_chats" in report.skipped
+    assert "birding_chats" in report.skipped
 
 
 def test_the_freeze_survives_into_the_next_session(tmp_path):
     """The count lives on disk, so the second caller cannot un-know the ban."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().flood_on("tdlibchat", 36468)
+    fake = FakeTransport().flood_on("tdlibchat", 36468)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         live.prepare([req("tdlibchat")])
 
-    fake2 = account.FakeTransport().answer_with("hanoi_chats", 2832)
+    fake2 = FakeTransport().answer_with("birding_chats", 2832)
     with make_session(tmp_path, fake2, live=True, cfg=cfg,
                       ledger=make_ledger(cfg)) as second:
-        report = second.prepare([req("hanoi_chats")])
+        report = second.prepare([req("birding_chats")])
     assert fake2.resolve_calls == []
     assert report.frozen is True
 
@@ -500,7 +503,7 @@ def test_the_freeze_survives_into_the_next_session(tmp_path):
 def test_a_usable_cached_peer_costs_nothing(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         report = live.prepare([req(cached_peer=good_peer())])
     assert report.from_cache == ["tdlibchat"]
@@ -513,7 +516,7 @@ def test_a_fingerprint_mismatch_is_discarded_silently_and_re_earned(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
     stale = good_peer(peer_id=999, fingerprint=session_fingerprint("1previous-login"))
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         report = live.prepare([req(cached_peer=stale)])
     assert report.cache_discarded == ["tdlibchat"]
@@ -524,7 +527,7 @@ def test_a_fingerprint_mismatch_is_discarded_silently_and_re_earned(tmp_path):
 
 
 def test_a_resolved_peer_is_stamped_with_the_current_session(tmp_path):
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122, 777)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122, 777)
     with make_session(tmp_path, fake, live=True) as live:
         peer = live.resolve(req())
     assert peer == {"id": 1006503122, "access_hash": 777,
@@ -534,7 +537,7 @@ def test_a_resolved_peer_is_stamped_with_the_current_session(tmp_path):
 
 
 def test_history_refuses_a_peer_from_another_login(tmp_path):
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True) as live:
         with pytest.raises(account.PeerUnusable):
             live.history(req(), good_peer(peer_id=7, fingerprint="stale"))
@@ -547,7 +550,7 @@ def test_history_refuses_a_peer_from_another_login(tmp_path):
 def test_reading_and_searching_never_join(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 7).with_history(7, [{"id": 1}])
+    fake = FakeTransport().answer_with("tdlibchat", 7).with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         report = live.prepare([req()])
         live.history(req(), report.peers["tdlibchat"])
@@ -562,7 +565,7 @@ def test_no_read_path_can_even_name_a_join():
     that a future one cannot start joining without the diff showing up in a
     method whose name is `join_group`.
     """
-    tokens = {"check_join", "record_join", "join_group"}
+    tokens = {"check_join", "record_join", "reserve_join", "join_group"}
     tree = ast.parse(Path(account.__file__).read_text(encoding="utf-8"))
     session_cls = next(node for node in tree.body
                        if isinstance(node, ast.ClassDef) and node.name == "AccountSession")
@@ -586,11 +589,11 @@ def test_no_read_path_can_even_name_a_join():
 def test_join_is_counted_against_its_own_daily_ceiling(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg, join_ceiling=1)
-    fake = account.FakeTransport()
+    fake = FakeTransport()
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         assert live.join_group(req(), good_peer())["joined"] is True
         with pytest.raises(BudgetExhausted):
-            live.join_group(req("hanoi_chats"), good_peer(peer_id=2832))
+            live.join_group(req("birding_chats"), good_peer(peer_id=2832))
     assert len(fake.join_calls) == 1
     assert ledger.read().joins == 1
 
@@ -598,7 +601,7 @@ def test_join_is_counted_against_its_own_daily_ceiling(tmp_path):
 def test_join_does_not_spend_the_resolve_budget(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport()
+    fake = FakeTransport()
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         live.join_group(req(), good_peer())
     assert fake.resolve_calls == []
@@ -611,11 +614,11 @@ def test_join_does_not_spend_the_resolve_budget(tmp_path):
 def test_a_second_caller_gets_account_busy_not_a_slower_run(tmp_path):
     cfg = make_cfg(tmp_path)
     first = account.AccountSession(
-        account.FakeTransport(), cfg=cfg, ledger=make_ledger(cfg), fingerprint=FP,
+        FakeTransport(), cfg=cfg, ledger=make_ledger(cfg), fingerprint=FP,
         lock=AccountLock(cfg.lock_path),
     )
     second = account.AccountSession(
-        account.FakeTransport(), cfg=cfg, ledger=make_ledger(cfg), fingerprint=FP,
+        FakeTransport(), cfg=cfg, ledger=make_ledger(cfg), fingerprint=FP,
         lock=AccountLock(cfg.lock_path),
     )
     with first:
@@ -626,7 +629,7 @@ def test_a_second_caller_gets_account_busy_not_a_slower_run(tmp_path):
 
 
 def test_nothing_spends_outside_the_lock(tmp_path):
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     session = make_session(tmp_path, fake, live=True)
     with pytest.raises(account.AccountError):
         session.resolve(req())
@@ -688,7 +691,7 @@ def test_reports_and_summaries_carry_no_credential(tmp_path):
 # 11. Dry run is the default, and live needs both switches
 # --------------------------------------------------------------------------
 def test_dry_run_is_the_default(tmp_path):
-    session = account.AccountSession(account.FakeTransport(), cfg=make_cfg(tmp_path),
+    session = account.AccountSession(FakeTransport(), cfg=make_cfg(tmp_path),
                                      fingerprint=FP)
     assert session.dry_run is True
 
@@ -696,14 +699,14 @@ def test_dry_run_is_the_default(tmp_path):
 def test_dry_run_makes_zero_transport_calls(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 7).with_history(7, [{"id": 1}])
+    fake = FakeTransport().answer_with("tdlibchat", 7).with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, cfg=cfg, ledger=ledger) as dry:
-        report = dry.prepare([req(), req("hanoi_chats")])
+        report = dry.prepare([req(), req("birding_chats")])
         page = dry.history(req(), good_peer(peer_id=7))
         joined = dry.join_group(req(), good_peer(peer_id=7))
 
     assert fake.resolve_calls == [] and fake.history_calls == [] and fake.join_calls == []
-    assert sorted(report.would_resolve) == ["hanoi_chats", "tdlibchat"]
+    assert sorted(report.would_resolve) == ["birding_chats", "tdlibchat"]
     assert report.peers == {}
     assert page.dry_run is True and page.messages == []
     assert page.would["call"] == "messages.getHistory"
@@ -726,13 +729,13 @@ def test_dry_run_still_refuses_what_live_would_refuse(tmp_path):
 def test_live_mode_needs_the_code_switch(tmp_path):
     turn_the_environment_switch_on()
     with pytest.raises(account.LiveModeRefused):
-        account.AccountSession(account.FakeTransport(), cfg=make_cfg(tmp_path),
+        account.AccountSession(FakeTransport(), cfg=make_cfg(tmp_path),
                                fingerprint=FP, dry_run=False)
 
 
 def test_live_mode_needs_the_environment_switch(tmp_path):
     with pytest.raises(account.LiveModeRefused) as exc:
-        account.AccountSession(account.FakeTransport(), cfg=make_cfg(tmp_path),
+        account.AccountSession(FakeTransport(), cfg=make_cfg(tmp_path),
                                fingerprint=FP, dry_run=False, allow_live=True)
     assert account.ENV_ALLOW_LIVE in str(exc.value)
 
@@ -740,7 +743,7 @@ def test_live_mode_needs_the_environment_switch(tmp_path):
 def test_live_mode_needs_both_switches_together(tmp_path):
     turn_the_environment_switch_on()
     session = account.AccountSession(
-        account.FakeTransport(), cfg=make_cfg(tmp_path), fingerprint=FP,
+        FakeTransport(), cfg=make_cfg(tmp_path), fingerprint=FP,
         dry_run=False, allow_live=True,
     )
     assert session.dry_run is False
@@ -753,7 +756,7 @@ def test_dry_run_never_reads_the_credential_file(tmp_path):
     ledger = make_ledger(cfg)
     ledger.fingerprint = FP
     ledger.write(ledger.read())
-    session = account.AccountSession(account.FakeTransport(), cfg=cfg, ledger=ledger)
+    session = account.AccountSession(FakeTransport(), cfg=cfg, ledger=ledger)
     assert session.fingerprint == FP
 
 
@@ -761,7 +764,7 @@ def test_history_flood_stops_the_run_without_freezing_resolves(tmp_path):
     """The 36 468 s freeze was measured on resolveUsername, not on history."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     fake.floods["history"] = 300
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         first = live.history(req(), good_peer(peer_id=7))
@@ -1146,7 +1149,7 @@ def test_import_telethon_collects_the_wait_errors_by_name(monkeypatch):
 # single most important structural rule.
 # --------------------------------------------------------------------------
 def test_history_requires_the_lock(tmp_path):
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     session = make_session(tmp_path, fake, live=True)
     with pytest.raises(account.AccountError) as exc:
         session.history(req(), good_peer(peer_id=7))
@@ -1157,7 +1160,7 @@ def test_history_requires_the_lock(tmp_path):
 def test_join_requires_the_lock(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport()
+    fake = FakeTransport()
     session = make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger)
     with pytest.raises(account.AccountError):
         session.join_group(req(), good_peer())
@@ -1167,7 +1170,7 @@ def test_join_requires_the_lock(tmp_path):
 
 def test_prepare_checks_evidence_before_it_touches_a_cached_peer(tmp_path):
     """The cached-peer path is inside the evidence gate, not around it."""
-    fake = account.FakeTransport().answer_with("durov", 1)
+    fake = FakeTransport().answer_with("durov", 1)
     card = tgparse.PeerCard(username="durov", exists=True, type="channel")
     request = account.SourceRequest(username="durov", evidence=card,
                                     cached_peer=good_peer(peer_id=5))
@@ -1197,7 +1200,7 @@ def test_a_flooded_resolve_is_recorded_as_a_failure(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = RecordingLedger(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                              burst_window=600, min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().flood_on("tdlibchat", 36468)
+    fake = FakeTransport().flood_on("tdlibchat", 36468)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(ResolveFrozen):
             live.resolve(req())
@@ -1210,20 +1213,20 @@ def test_the_run_latch_stops_a_second_resolve_even_if_the_disk_forgot(tmp_path):
     ledger = UnpersistedFreezeLedger(cfg.ledger_path, daily_ceiling=180,
                                      burst_ceiling=100, burst_window=600,
                                      min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().flood_on("tdlibchat", 36468)
-    fake.answer_with("hanoi_chats", 2832)
+    fake = FakeTransport().flood_on("tdlibchat", 36468)
+    fake.answer_with("birding_chats", 2832)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(ResolveFrozen):
             live.resolve(req())
         with pytest.raises(ResolveFrozen):
-            live.resolve(req("hanoi_chats"))       # a different name, same run
+            live.resolve(req("birding_chats"))       # a different name, same run
     assert [c["username"] for c in fake.resolve_calls] == ["tdlibchat"]
 
 
 def test_a_peer_is_stamped_with_our_fingerprint_not_the_transports(tmp_path):
     """The transport does not get to say which login session minted the hash."""
 
-    class LyingTransport(account.FakeTransport):
+    class LyingTransport(FakeTransport):
         def resolve_username(self, username, *, options=None):
             self.resolve_calls.append({"username": username, "options": options})
             return {"id": 5, "access_hash": 6, "auth_session_fingerprint": "another-login"}
@@ -1237,7 +1240,7 @@ def test_a_peer_is_stamped_with_our_fingerprint_not_the_transports(tmp_path):
 # --------------------------------------------------------------------------
 # 15. Errors that used to lose the budget, the count, or the credential
 # --------------------------------------------------------------------------
-class ExplodingTransport(account.FakeTransport):
+class ExplodingTransport(FakeTransport):
     """Fails the ordinary way -- a reset connection -- carrying a session string."""
 
     def __init__(self, boom: str = "*", **kw):
@@ -1285,7 +1288,7 @@ def test_a_join_that_fails_with_one_of_our_own_errors_is_counted_too(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
 
-    class FloodingJoin(account.FakeTransport):
+    class FloodingJoin(FakeTransport):
         def join_group(self, peer, *, options=None):
             self.join_calls.append({"peer": dict(peer), "options": options})
             raise account.FloodWait(300, "channels.joinChannel")
@@ -1317,22 +1320,22 @@ def test_prepare_keeps_the_peers_it_paid_for_when_a_later_source_explodes(tmp_pa
     """Seven paid-for peers used to die with the exception raised by the eighth."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = ExplodingTransport(boom="hanoi_chats")
+    fake = ExplodingTransport(boom="birding_chats")
     fake.answer_with("tdlibchat", 1006503122).answer_with("durovs_chat", 3)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
-        report = live.prepare([req(), req("hanoi_chats"), req("durovs_chat")])
+        report = live.prepare([req(), req("birding_chats"), req("durovs_chat")])
     assert report.resolved == ["tdlibchat"]
     assert report.peers["tdlibchat"]["id"] == 1006503122
-    assert "hanoi_chats" in report.skipped and "durovs_chat" in report.skipped
+    assert "birding_chats" in report.skipped and "durovs_chat" in report.skipped
     # The third name is never tried: something we do not understand happened.
-    assert [c["username"] for c in fake.resolve_calls] == ["tdlibchat", "hanoi_chats"]
+    assert [c["username"] for c in fake.resolve_calls] == ["tdlibchat", "birding_chats"]
     assert FAKE_SESSION not in repr(report.as_dict())
     assert ledger.read().resolves == 2
 
 
 def test_a_bad_source_still_hands_back_the_report(tmp_path):
     """Fail loudly, yes. Destroy the run's paid-for work on the way out, no."""
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     bad = account.SourceRequest(username="durov",
                                 evidence={"exists": True, "type": "channel",
                                           "username": "durov"})
@@ -1357,7 +1360,7 @@ def test_a_switch_that_does_not_say_yes_refuses_live_mode(tmp_path, value):
     """
     turn_the_environment_switch_on(value)
     with pytest.raises(account.LiveModeRefused) as exc:
-        account.AccountSession(account.FakeTransport(), cfg=make_cfg(tmp_path),
+        account.AccountSession(FakeTransport(), cfg=make_cfg(tmp_path),
                                fingerprint=FP, dry_run=False, allow_live=True)
     assert account.ENV_ALLOW_LIVE in str(exc.value)
 
@@ -1366,7 +1369,7 @@ def test_a_switch_that_does_not_say_yes_refuses_live_mode(tmp_path, value):
 def test_a_switch_that_says_yes_allows_live_mode(tmp_path, value):
     turn_the_environment_switch_on(value)
     session = account.AccountSession(
-        account.FakeTransport(), cfg=make_cfg(tmp_path), fingerprint=FP,
+        FakeTransport(), cfg=make_cfg(tmp_path), fingerprint=FP,
         dry_run=False, allow_live=True,
     )
     assert session.dry_run is False
@@ -1392,14 +1395,14 @@ def test_a_history_flood_outlives_the_process_that_earned_it(tmp_path):
     second later -- knew nothing and called getHistory again immediately.
     """
     cfg = make_cfg(tmp_path)
-    first_transport = account.FakeTransport().with_history(7, [{"id": 1}])
+    first_transport = FakeTransport().with_history(7, [{"id": 1}])
     first_transport.floods["history"] = 36468
     with make_session(tmp_path, first_transport, live=True, cfg=cfg) as live:
         page = live.history(req(), good_peer(peer_id=7))
     assert page.stopped and page.truncated is True
     assert history_log_of(cfg).frozen_for() > 36000
 
-    second_transport = account.FakeTransport().with_history(7, [{"id": 1}])
+    second_transport = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, second_transport, live=True, cfg=cfg) as second:
         page2 = second.history(req(), good_peer(peer_id=7))
     assert second_transport.history_calls == []     # the next run waits it out
@@ -1411,7 +1414,7 @@ def test_a_history_flood_outlives_the_process_that_earned_it(tmp_path):
 
 def test_every_history_page_is_counted_on_disk(tmp_path):
     cfg = make_cfg(tmp_path)
-    fake = account.FakeTransport().with_history(7, [{"id": 3}, {"id": 2}, {"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 3}, {"id": 2}, {"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         for _ in range(3):
             live.history(req(), good_peer(peer_id=7), limit=1)
@@ -1424,7 +1427,7 @@ def test_history_stops_at_the_run_ceiling(tmp_path):
     """Five hundred pages under one lock used to be recorded nowhere and refused never."""
     cfg = make_cfg(tmp_path)
     cfg.budgets.max_requests_per_run = 2
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         pages = [live.history(req(), good_peer(peer_id=7)) for _ in range(4)]
     assert len(fake.history_calls) == 2
@@ -1436,7 +1439,7 @@ def test_history_pages_are_paced(tmp_path):
     cfg = make_cfg(tmp_path)
     cfg.budgets.min_gap_sec = 2.0
     sleeps: list[float] = []
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg, sleeps=sleeps) as live:
         live.history(req(), good_peer(peer_id=7))
         live.history(req(), good_peer(peer_id=7))
@@ -1449,7 +1452,7 @@ def test_an_unreadable_history_state_file_refuses_rather_than_permits(tmp_path):
     cfg = make_cfg(tmp_path)
     path = Path(cfg.state_dir) / account.HISTORY_STATE_FILE
     path.write_text("{truncated", encoding="utf-8")
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         with pytest.raises(account.StateUnreadable):
             live.history(req(), good_peer(peer_id=7))
@@ -1471,7 +1474,7 @@ def test_a_name_already_resolved_in_this_run_is_not_resolved_again(tmp_path):
     """Out of a burst ceiling of 8, a duplicated candidate used to cost a name."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         first = live.prepare([req(), req(), req()])
         second = live.prepare([req()])
@@ -1494,7 +1497,7 @@ def test_a_non_dyadic_minimum_gap_does_not_refuse_the_call_it_waited_for(tmp_pat
     ledger = make_ledger(cfg, min_gap=30.1)
     ledger.record_resolve("earlier", ok=True)
     sleeps: list[float] = []
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger,
                       sleeps=sleeps) as live:
         live.resolve(req())
@@ -1521,7 +1524,7 @@ def test_a_pause_does_not_end_the_run_but_a_ceiling_does(tmp_path):
     transient = GapOnlyLedger(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                               burst_window=600, min_gap=30.0, join_ceiling=3)
     transient.opens_at = time.time() + 5.0
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=transient) as live:
         report = live.prepare([req()])
         assert live._budget_stop is False           # the run is still alive
@@ -1547,7 +1550,7 @@ def test_a_dry_run_says_whose_login_session_it_judged_the_cache_against(tmp_path
     """
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    dry = account.AccountSession(account.FakeTransport(), cfg=cfg, ledger=ledger)
+    dry = account.AccountSession(FakeTransport(), cfg=cfg, ledger=ledger)
     assert dry.fingerprint_verified is False
     assert dry.summary()["fingerprint_source"] == "ledger"
     with dry:
@@ -1571,7 +1574,7 @@ def test_the_session_closes_the_transport_before_it_drops_the_lock(tmp_path):
     """
     events: list[str] = []
 
-    class ClosingTransport(account.FakeTransport):
+    class ClosingTransport(FakeTransport):
         def close(self):
             events.append("close")
 
@@ -1595,7 +1598,7 @@ def test_a_transport_that_cannot_close_is_not_a_failure(tmp_path):
     """FakeTransport has no close(), and a broken close() must not eat the lock."""
     events: list[str] = []
 
-    class AngryTransport(account.FakeTransport):
+    class AngryTransport(FakeTransport):
         def close(self):
             raise RuntimeError("TELEGRAM_SESSION=" + FAKE_SESSION)
 
@@ -1659,7 +1662,7 @@ def test_main_prints_the_status_and_parses_the_live_switch(tmp_path, monkeypatch
 def test_a_page_that_stopped_says_it_is_truncated(tmp_path):
     """`while page.messages:` reads a stopped page as the end of the group."""
     cfg = make_cfg(tmp_path)
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     fake.floods["history"] = 300
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         page = live.history(req(), good_peer(peer_id=7))
@@ -1680,7 +1683,7 @@ def test_a_page_that_stopped_says_it_is_truncated(tmp_path):
 # ==========================================================================
 
 # -- a resolve is counted, durably, BEFORE the call leaves -------------------
-class KilledMidCall(account.FakeTransport):
+class KilledMidCall(FakeTransport):
     """The request is on the wire and the process dies.
 
     `KeyboardInterrupt` is a `BaseException`, so no `except Exception` in the
@@ -1727,7 +1730,7 @@ def test_the_charge_is_on_disk_while_the_call_is_still_in_flight(tmp_path):
     ledger = make_ledger(cfg)
     seen: dict = {}
 
-    class LooksAtTheLedger(account.FakeTransport):
+    class LooksAtTheLedger(FakeTransport):
         def resolve_username(self, username, *, options=None):
             state = ResolveLedger(cfg.ledger_path).read()
             seen["resolves"] = state.resolves
@@ -1758,7 +1761,7 @@ def test_a_failed_settle_does_not_replace_the_error_the_caller_is_handling(tmp_p
 
     ledger = SettleFails(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                          burst_window=600, min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().not_found("tdlibchat")
+    fake = FakeTransport().not_found("tdlibchat")
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(account.PeerNotFound):
             live.resolve(req())
@@ -1788,7 +1791,7 @@ def test_a_floodwait_freezes_even_when_the_accounting_write_fails(tmp_path):
     ledger = AccountingWriteFails(cfg.ledger_path, daily_ceiling=180,
                                   burst_ceiling=100, burst_window=600,
                                   min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().flood_on("tdlibchat", 36468)
+    fake = FakeTransport().flood_on("tdlibchat", 36468)
     session = make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger)
     with session as live:
         with pytest.raises(ResolveFrozen):
@@ -1815,7 +1818,7 @@ def test_a_freeze_that_cannot_be_written_says_that_it_is_not_on_disk(tmp_path):
 
     ledger = FreezeWriteFails(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                               burst_window=600, min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().flood_on("tdlibchat", 36468)
+    fake = FakeTransport().flood_on("tdlibchat", 36468)
     session = make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger)
     with session as live:
         with pytest.raises(ResolveFrozen) as exc:
@@ -1849,7 +1852,7 @@ def test_a_history_page_refreshes_the_account_lock(tmp_path):
     """
     cfg = make_cfg(tmp_path)
     lock = AccountLock(cfg.lock_path, stale_after=100.0)
-    fake = account.FakeTransport().with_history(7, [{"id": 3}, {"id": 2}, {"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 3}, {"id": 2}, {"id": 1}])
     turn_the_environment_switch_on()
     session = account.AccountSession(
         fake, cfg=cfg, ledger=make_ledger(cfg), lock=lock, fingerprint=FP,
@@ -1874,7 +1877,7 @@ def test_the_lock_is_refreshed_before_the_page_as_well_as_after(tmp_path):
     lock = AccountLock(cfg.lock_path, stale_after=100.0)
     seen: dict = {}
 
-    class LooksAtTheLock(account.FakeTransport):
+    class LooksAtTheLock(FakeTransport):
         def fetch_history(self, peer, *, limit=100, offset_id=0, options=None):
             seen["ts"] = json.loads(cfg.lock_path.read_text(encoding="utf-8"))["ts"]
             return super().fetch_history(peer, limit=limit, offset_id=offset_id,
@@ -1937,7 +1940,7 @@ def test_a_history_flood_that_cannot_be_written_still_returns_a_page(tmp_path,
     wait belongs in the page it gets back, not in a traceback -- and the page has
     to say the wait is not on disk."""
     cfg = make_cfg(tmp_path)
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
     fake.floods["history"] = 36468
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         monkeypatch.setattr(configmod, "atomic_write_text",
@@ -1976,7 +1979,7 @@ def test_prepare_keeps_its_peers_when_the_ledger_dies_mid_run(tmp_path):
     ledger = TruncatedByAnotherWriter(cfg.ledger_path, daily_ceiling=180,
                                       burst_ceiling=100, burst_window=600,
                                       min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport()
+    fake = FakeTransport()
     for i, name in enumerate(("one", "two", "three", "four")):
         fake.answer_with(name, 100 + i)
 
@@ -1999,7 +2002,7 @@ def test_the_second_switch_cannot_be_passed_in_as_a_keyword(tmp_path):
     of Python. The keyword is gone; nothing reads a caller-supplied environment.
     """
     with pytest.raises(TypeError):
-        account.AccountSession(account.FakeTransport(), cfg=make_cfg(tmp_path),
+        account.AccountSession(FakeTransport(), cfg=make_cfg(tmp_path),
                                fingerprint=FP, dry_run=False, allow_live=True,
                                env={account.ENV_ALLOW_LIVE: "1"})
     assert "env" not in account.AccountSession.__init__.__code__.co_varnames
@@ -2008,7 +2011,7 @@ def test_the_second_switch_cannot_be_passed_in_as_a_keyword(tmp_path):
 def test_dry_run_cannot_be_switched_off_by_assignment(tmp_path):
     """One attribute assignment on a session constructed
     with no switches at all put a real `contacts.resolveUsername` on the wire."""
-    fake = account.FakeTransport().answer_with("tdlibchat", 1)
+    fake = FakeTransport().answer_with("tdlibchat", 1)
     session = account.AccountSession(fake, cfg=make_cfg(tmp_path), fingerprint=FP)
     assert session.dry_run is True
     with pytest.raises(AttributeError):
@@ -2024,13 +2027,13 @@ def test_the_environment_switch_is_read_at_the_call_not_at_construction(tmp_path
     expect the run that is already going to keep spending."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1).with_history(
+    fake = FakeTransport().answer_with("tdlibchat", 1).with_history(
         7, [{"id": 1}])
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         live.resolve(req())                          # the switch is on: this works
         del os.environ[account.ENV_ALLOW_LIVE]       # ... and now it is not
         with pytest.raises(account.LiveModeRefused):
-            live.resolve(req("hanoi_chats"))
+            live.resolve(req("birding_chats"))
         with pytest.raises(account.LiveModeRefused):
             live.history(req(), good_peer(peer_id=7))
         with pytest.raises(account.LiveModeRefused):
@@ -2084,7 +2087,7 @@ def test_a_dry_run_meets_the_same_ceilings_the_live_run_would(tmp_path):
         planned = dry.prepare(thirty())
 
     live_cfg = make_cfg(tmp_path / "live")
-    fake = account.FakeTransport()
+    fake = FakeTransport()
     for i in range(30):
         fake.answer_with("src%d" % i, 1000 + i)
     with make_session(tmp_path, fake, live=True, cfg=live_cfg,
@@ -2173,8 +2176,21 @@ def test_a_transport_that_is_not_connected_charges_nothing(tmp_path):
     zero packets sent. The readiness question is asked before the budget."""
     cfg = make_cfg(tmp_path)
     ledger = make_ledger(cfg)
-    never_connected = account.TelethonTransport(1234567, "deadbeef" * 4, FAKE_SESSION)
-    assert never_connected.connected is False
+    assert account.TelethonTransport(
+        1234567, "deadbeef" * 4, FAKE_SESSION).connected is False
+
+    class NeverConnected(FakeTransport):
+        """Says "not connected" and offers no `connect` to change its mind.
+
+        A real `TelethonTransport` no longer fits here: `__enter__` connects an
+        unconnected transport itself now, inside the lock, so a transport that
+        says no and CAN connect never reaches the per-call check. What this test
+        is about is the other kind -- one that says no and stays that way -- and
+        the rule that it is refused before the budget is touched.
+        """
+        connected = False
+
+    never_connected = NeverConnected()
     with make_session(tmp_path, never_connected, live=True, cfg=cfg,
                       ledger=ledger) as live:
         for name in ("a", "b", "c"):
@@ -2238,13 +2254,13 @@ def test_the_history_ceiling_belongs_to_the_run_not_to_the_session(tmp_path):
     cfg.budgets.max_requests_per_run = 3
     peer = good_peer(peer_id=7)
 
-    first = account.FakeTransport().with_history(7, [{"id": 1}])
+    first = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, first, live=True, cfg=cfg) as live:
         pages = [live.history(req(), peer) for _ in range(5)]
     assert len(first.history_calls) == 3
     assert [p.truncated for p in pages] == [False, False, False, True, True]
 
-    second = account.FakeTransport().with_history(7, [{"id": 1}])
+    second = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, second, live=True, cfg=cfg) as live:
         page = live.history(req(), peer)
     assert second.history_calls == []
@@ -2318,7 +2334,7 @@ def test_a_history_ceiling_of_zero_fetches_no_pages_at_all(tmp_path):
     cfg = make_cfg(tmp_path)
     cfg.budgets.max_history_requests_per_run = 0
     cfg.budgets.max_requests_per_run = 0
-    fake = account.FakeTransport().with_history(7, [{"id": 1}])
+    fake = FakeTransport().with_history(7, [{"id": 1}])
 
     with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
         pages = [live.history(req(), good_peer(peer_id=7)) for _ in range(3)]
@@ -2368,7 +2384,7 @@ def test_an_override_cannot_raise_the_gethistory_ceiling(tmp_path):
 
 
 # -- a call that reached Telegram is charged ---------------------------------
-class KilledMidJoin(account.FakeTransport):
+class KilledMidJoin(FakeTransport):
     """The join is on the wire and the process is gone. `KeyboardInterrupt` is a
     `BaseException`, so no `except Exception` in the module catches it."""
 
@@ -2401,7 +2417,7 @@ def test_a_history_page_killed_mid_call_is_still_counted(tmp_path):
     served. Lower stakes than the join ceiling, same rule."""
     cfg = make_cfg(tmp_path)
 
-    class KilledMidPage(account.FakeTransport):
+    class KilledMidPage(FakeTransport):
         def fetch_history(self, peer, *, limit=100, offset_id=0, options=None):
             self.history_calls.append({"peer": dict(peer), "limit": limit})
             raise KeyboardInterrupt("the page is in flight and we are gone")
@@ -2417,7 +2433,7 @@ def test_a_history_page_killed_mid_call_is_still_counted(tmp_path):
 
 
 # -- a call that never left is charged nothing -------------------------------
-class RefusesBeforeTheWire(account.FakeTransport):
+class RefusesBeforeTheWire(FakeTransport):
     """A transport that refuses a string peer the way the real one does.
 
     `TelethonTransport._input_peer` raises before a byte is sent, because
@@ -2475,12 +2491,12 @@ def test_history_pacing_holds_across_two_sessions_in_one_process(tmp_path):
     cfg.budgets.min_gap_sec = 2.0
     sleeps: list[float] = []
 
-    first = account.FakeTransport().with_history(7, [{"id": 1}])
+    first = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, first, live=True, cfg=cfg, sleeps=sleeps) as live:
         live.history(req(), good_peer(peer_id=7))
     assert sleeps == []                     # nothing came before it
 
-    second = account.FakeTransport().with_history(7, [{"id": 1}])
+    second = FakeTransport().with_history(7, [{"id": 1}])
     with make_session(tmp_path, second, live=True, cfg=cfg, sleeps=sleeps) as live:
         live.history(req(), good_peer(peer_id=7))
 
@@ -2525,9 +2541,16 @@ def test_a_moment_in_time_no_calendar_has_is_our_own_error_too(tmp_path):
     for hostile in (float("inf"), float("nan"), 1e308):
         with pytest.raises(account.AccountError):
             log.frozen_for(now=hostile)
-    with pytest.raises(account.AccountError):
-        log.freeze(float("nan"), "FloodWait with an unreadable number")
-    assert not path.exists(), "nothing was written for a freeze we could not record"
+
+    # The freeze goes the OTHER way, and deliberately: refusing to record a wait
+    # Telegram has already imposed is the fail-open direction, so a number this
+    # module cannot read buys the bounded wait the ledger has always used and
+    # says in the reason that it is not the number that was asked for. It used
+    # to raise and write NOTHING, leaving the next process with no wait at all.
+    log.freeze(float("nan"), "FloodWait with an unreadable number")
+    assert path.exists(), "the wait Telegram imposed has to be on disk"
+    assert log.frozen_for() > 0
+    assert "not a number of seconds" in log.read()["frozen_reason"]
 
 
 # -- status() asks the configuration first -----------------------------------
@@ -2589,7 +2612,7 @@ def test_the_reservation_token_is_the_one_that_gets_settled(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = TokenLedger(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                          burst_window=600, min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    fake = FakeTransport().answer_with("tdlibchat", 1006503122)
 
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         live.resolve(req())
@@ -2607,7 +2630,7 @@ def test_a_failed_resolve_settles_its_own_token_too(tmp_path):
     cfg = make_cfg(tmp_path)
     ledger = TokenLedger(cfg.ledger_path, daily_ceiling=180, burst_ceiling=100,
                          burst_window=600, min_gap=0.0, join_ceiling=3)
-    fake = account.FakeTransport().not_found("tdlibchat")
+    fake = FakeTransport().not_found("tdlibchat")
 
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(account.PeerNotFound):
@@ -2648,7 +2671,7 @@ def test_the_reservation_on_disk_carries_the_name_it_is_for(tmp_path):
     ledger = make_ledger(cfg)
     seen: dict = {}
 
-    class LooksAtTheLedgerThenDies(account.FakeTransport):
+    class LooksAtTheLedgerThenDies(FakeTransport):
         def resolve_username(self, username, *, options=None):
             self.resolve_calls.append({"username": username, "options": options})
             seen["pending"] = ResolveLedger(cfg.ledger_path).read().pending
@@ -2657,18 +2680,18 @@ def test_the_reservation_on_disk_carries_the_name_it_is_for(tmp_path):
     fake = LooksAtTheLedgerThenDies()
     with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
         with pytest.raises(KeyboardInterrupt):
-            live.resolve(req("hanoi_chats"))
+            live.resolve(req("birding_chats"))
 
-    assert [p.get("username") for p in seen["pending"]] == ["hanoi_chats"]
+    assert [p.get("username") for p in seen["pending"]] == ["birding_chats"]
     # ... and it outlives the run that took it, which is the whole point
     abandoned = ResolveLedger(cfg.ledger_path).pending_resolves()
-    assert [p.get("username") for p in abandoned] == ["hanoi_chats"]
+    assert [p.get("username") for p in abandoned] == ["birding_chats"]
 
 
 def test_a_healthy_resolve_leaves_the_dead_run_s_reservation_alone(tmp_path):
     """Two runs, one process's worth of evidence between them.
 
-    Run A is killed with `@hanoi_chats` on the wire. Run B resolves
+    Run A is killed with `@birding_chats` on the wire. Run B resolves
     `@tdlibchat` and settles. Before the token both reservations were anonymous and
     `record_resolve` settled the oldest nameless one it could find, so B's
     settlement cleared A's record: `summary()` then reported a pending resolve
@@ -2677,7 +2700,7 @@ def test_a_healthy_resolve_leaves_the_dead_run_s_reservation_alone(tmp_path):
     """
     cfg = make_cfg(tmp_path)
 
-    class DiesMidCall(account.FakeTransport):
+    class DiesMidCall(FakeTransport):
         def resolve_username(self, username, *, options=None):
             self.resolve_calls.append({"username": username, "options": options})
             raise KeyboardInterrupt("killed with the call on the wire")
@@ -2685,16 +2708,16 @@ def test_a_healthy_resolve_leaves_the_dead_run_s_reservation_alone(tmp_path):
     with make_session(tmp_path, DiesMidCall(), live=True, cfg=cfg,
                       ledger=make_ledger(cfg)) as dying:
         with pytest.raises(KeyboardInterrupt):
-            dying.resolve(req("hanoi_chats"))
+            dying.resolve(req("birding_chats"))
 
-    healthy = account.FakeTransport().answer_with("tdlibchat", 1006503122)
+    healthy = FakeTransport().answer_with("tdlibchat", 1006503122)
     with make_session(tmp_path, healthy, live=True, cfg=cfg,
                       ledger=make_ledger(cfg)) as second:
         assert second.resolve(req("tdlibchat"))["id"] == 1006503122
 
     state = ResolveLedger(cfg.ledger_path).read()
     assert state.resolves == 2                       # both calls left the machine
-    assert [p.get("username") for p in state.pending] == ["hanoi_chats"], (
+    assert [p.get("username") for p in state.pending] == ["birding_chats"], (
         "the healthy run settled the reservation the dead run left behind")
 
 
@@ -2710,10 +2733,10 @@ def test_a_healthy_resolve_leaves_the_dead_run_s_reservation_alone(tmp_path):
 
 
 PEER_ROWS = [
-    {"username": "hanoi_chats", "id": 1931920118, "access_hash": 77,
+    {"username": "birding_chats", "id": 1000000001, "access_hash": 77,
      "type": "group", "title": "Большой чат | Общение",
      "participants": 2835, "verified": False, "scam": False},
-    {"username": "vietnam_ru", "id": 42, "access_hash": 99, "type": "channel",
+    {"username": "wildlife_ru", "id": 42, "access_hash": 99, "type": "channel",
      "title": "Новостной канал", "participants": 51000, "verified": False, "scam": False},
 ]
 
@@ -2726,8 +2749,8 @@ HITS = [{"id": 28569, "date": "2026-03-12T00:49:08+00:00", "text": "первое
 
 
 def searching(tmp_path, **kw):
-    fake = account.FakeTransport().with_contacts("тестовый запрос", PEER_ROWS)
-    fake.with_hits(1931920118, "слово", HITS, total=44)
+    fake = FakeTransport().with_contacts("тестовый запрос", PEER_ROWS)
+    fake.with_hits(1000000001, "слово", HITS, total=44)
     return fake, make_session(tmp_path, fake, live=True, **kw)
 
 
@@ -2745,7 +2768,7 @@ def test_contacts_search_hands_over_the_peer_without_a_single_resolve(tmp_path):
         found = live.search_contacts("тестовый запрос")
     assert fake.resolve_calls == [], "a search path resolved a username"
     assert found["requests"] == 1
-    assert [row["username"] for row in found["peers"]] == ["hanoi_chats", "vietnam_ru"]
+    assert [row["username"] for row in found["peers"]] == ["birding_chats", "wildlife_ru"]
     assert found["peers_cached"] == 2
 
 
@@ -2762,8 +2785,8 @@ def test_the_peer_a_search_paid_for_is_on_disk_for_the_next_process(tmp_path):
     with session as live:
         live.search_contacts("тестовый запрос")
     fresh = account.PeerCache(Path(cfg.state_dir) / account.PEER_CACHE_FILE)
-    assert fresh.get("hanoi_chats", FP)["access_hash"] == 77
-    assert fresh.get("hanoi_chats", "another-login") is None, \
+    assert fresh.get("birding_chats", FP)["access_hash"] == 77
+    assert fresh.get("birding_chats", "another-login") is None, \
         "a peer from one login was handed to another"
     assert fresh.get("nobody_here", FP) is None
 
@@ -2771,9 +2794,9 @@ def test_the_peer_a_search_paid_for_is_on_disk_for_the_next_process(tmp_path):
 def test_messages_search_answers_a_group_in_one_call_and_says_what_it_left(tmp_path):
     fake, session = searching(tmp_path)
     with session as live:
-        peer = {"id": 1931920118, "access_hash": 77, "type": "group",
+        peer = {"id": 1000000001, "access_hash": 77, "type": "group",
                 "auth_session_fingerprint": FP}
-        page = live.search_messages("hanoi_chats", peer, "слово", limit=50)
+        page = live.search_messages("birding_chats", peer, "слово", limit=50)
     assert fake.resolve_calls == [] and len(fake.search_calls) == 1
     assert page["requests"] == 1
     assert [m["id"] for m in page["messages"]] == [28569, 15597]
@@ -2793,17 +2816,17 @@ def test_a_channel_is_never_searched_through_the_account(tmp_path):
         peer = {"id": 42, "access_hash": 99, "type": "channel",
                 "auth_session_fingerprint": FP}
         with pytest.raises(account.WrongSurface):
-            live.search_messages("vietnam_ru", peer, "слово")
+            live.search_messages("wildlife_ru", peer, "слово")
     assert fake.search_calls == [], "the refused channel still reached the wire"
 
 
 def test_a_peer_from_another_login_is_refused_before_the_wire(tmp_path):
     fake, session = searching(tmp_path)
     with session as live:
-        peer = {"id": 1931920118, "access_hash": 77, "type": "group",
+        peer = {"id": 1000000001, "access_hash": 77, "type": "group",
                 "auth_session_fingerprint": "some-other-login"}
         with pytest.raises(account.PeerUnusable):
-            live.search_messages("hanoi_chats", peer, "слово")
+            live.search_messages("birding_chats", peer, "слово")
     assert fake.search_calls == []
 
 
@@ -2817,10 +2840,10 @@ def test_a_stale_access_hash_is_named_rather_than_reported_as_a_failure(tmp_path
     fake, session = searching(tmp_path)
     fake.stale_peer(77)
     with session as live:
-        peer = {"id": 1931920118, "access_hash": 77, "type": "group",
+        peer = {"id": 1000000001, "access_hash": 77, "type": "group",
                 "auth_session_fingerprint": FP}
         with pytest.raises(account.PeerUnusable) as exc:
-            live.search_messages("hanoi_chats", peer, "слово")
+            live.search_messages("birding_chats", peer, "слово")
     assert "contacts.search" in str(exc.value)
 
 
@@ -2837,8 +2860,8 @@ def test_a_stale_hash_does_not_latch_the_run_that_can_repair_it(tmp_path):
     fake.stale_peer(77)
     with session as live:
         with pytest.raises(account.PeerUnusable):
-            live.search_messages("hanoi_chats",
-                                 {"id": 1931920118, "access_hash": 77, "type": "group",
+            live.search_messages("birding_chats",
+                                 {"id": 1000000001, "access_hash": 77, "type": "group",
                                   "auth_session_fingerprint": FP}, "слово")
         assert live.account_calls == 1, "a call Telegram answered went uncounted"
         # The run may carry on -- which is the whole point.
@@ -2858,9 +2881,9 @@ def test_a_flood_on_a_search_outlives_the_process_that_earned_it(tmp_path):
     fake, session = searching(tmp_path, cfg=cfg)
     fake.floods["messages.search"] = 36468
     with session as live:
-        peer = {"id": 1931920118, "access_hash": 77, "type": "group",
+        peer = {"id": 1000000001, "access_hash": 77, "type": "group",
                 "auth_session_fingerprint": FP}
-        page = live.search_messages("hanoi_chats", peer, "слово")
+        page = live.search_messages("birding_chats", peer, "слово")
         assert page["stopped"] and "36468" in page["stopped"]
         # And the run stops calling: the second query does not reach the wire.
         again = live.search_contacts("что угодно")
@@ -2877,18 +2900,18 @@ def test_one_ceiling_covers_history_and_both_searches(tmp_path):
     cfg = make_cfg(tmp_path)
     cfg.budgets.max_history_requests_per_run = 2
     fake, session = searching(tmp_path, cfg=cfg)
-    peer = {"id": 1931920118, "access_hash": 77, "type": "group",
+    peer = {"id": 1000000001, "access_hash": 77, "type": "group",
             "auth_session_fingerprint": FP}
     with session as live:
         assert live.search_contacts("тестовый запрос")["requests"] == 1
-        assert live.search_messages("hanoi_chats", peer, "слово")["requests"] == 1
-        third = live.search_messages("hanoi_chats", peer, "слово")
+        assert live.search_messages("birding_chats", peer, "слово")["requests"] == 1
+        third = live.search_messages("birding_chats", peer, "слово")
     assert third["stopped"] and "ceiling is 2" in third["stopped"]
     assert len(fake.search_calls) == 1, "the ceiling did not stop the wire call"
 
 
 def test_a_dry_run_searches_nothing_and_says_what_it_would_send(tmp_path):
-    fake = account.FakeTransport().with_contacts("слово", PEER_ROWS)
+    fake = FakeTransport().with_contacts("слово", PEER_ROWS)
     session = make_session(tmp_path, fake, live=False)
     with session as preview:
         planned = preview.search_contacts("слово")
@@ -2905,8 +2928,8 @@ def test_neither_search_can_be_made_to_spend_stars(tmp_path):
     fake, session = searching(tmp_path, cfg=cfg, options={"allow_paid_stars": True})
     with session as live:
         live.search_contacts("тестовый запрос")
-        live.search_messages("hanoi_chats",
-                             {"id": 1931920118, "access_hash": 77, "type": "group",
+        live.search_messages("birding_chats",
+                             {"id": 1000000001, "access_hash": 77, "type": "group",
                               "auth_session_fingerprint": FP}, "слово")
     assert fake.contacts_calls[0]["options"]["allow_paid_stars"] is None
     assert fake.search_calls[0]["options"]["allow_paid_stars"] is None
@@ -2920,8 +2943,8 @@ def test_an_empty_query_is_refused_rather_than_answered_with_nothing(tmp_path):
         with pytest.raises(account.AccountError):
             live.search_contacts("   ")
         with pytest.raises(account.AccountError):
-            live.search_messages("hanoi_chats",
-                                 {"id": 1931920118, "access_hash": 77,
+            live.search_messages("birding_chats",
+                                 {"id": 1000000001, "access_hash": 77,
                                   "type": "group", "auth_session_fingerprint": FP}, "")
     assert fake.contacts_calls == [] and fake.search_calls == []
 
@@ -2933,7 +2956,7 @@ def test_a_peer_cache_that_cannot_be_read_is_empty_rather_than_trusted(tmp_path)
     path = Path(tmp_path) / "peers.json"
     path.write_text("{not json", encoding="utf-8")
     cache = account.PeerCache(path)
-    assert cache.get("hanoi_chats", FP) is None
+    assert cache.get("birding_chats", FP) is None
     assert cache.read() == {}
     # It names the file and carries the reason, rather than going quietly empty.
     assert str(path) in cache.unreadable and "could not be read" in cache.unreadable
@@ -2943,10 +2966,10 @@ def test_a_peer_cache_that_cannot_be_read_is_empty_rather_than_trusted(tmp_path)
 def test_a_dropped_peer_is_really_gone(tmp_path):
     cache = account.PeerCache(Path(tmp_path) / "peers.json")
     cache.put(PEER_ROWS, FP)
-    assert cache.drop("hanoi_chats") is True
-    assert cache.get("hanoi_chats", FP) is None
-    assert cache.get("vietnam_ru", FP) is not None, "drop took the wrong record"
-    assert cache.drop("hanoi_chats") is False
+    assert cache.drop("birding_chats") is True
+    assert cache.get("birding_chats", FP) is None
+    assert cache.get("wildlife_ru", FP) is not None, "drop took the wrong record"
+    assert cache.drop("birding_chats") is False
 
 
 def test_a_peer_that_could_never_be_handed_out_is_not_stored(tmp_path):
@@ -2967,10 +2990,10 @@ def test_a_peer_record_types_a_supergroup_and_skips_what_cannot_be_a_source():
     """`megagroup` is the only field that separates a public group from a channel
     on this surface, and it has to land in the SAME word the free landing card
     settles -- `verify` reads members for a group and subscribers for a channel."""
-    group = SimpleNamespace(id=1, access_hash=7, username="hanoi_chats",
+    group = SimpleNamespace(id=1, access_hash=7, username="birding_chats",
                             title="Чат", megagroup=True, broadcast=False,
                             participants_count=2835, verified=False, scam=False)
-    channel = SimpleNamespace(id=2, access_hash=8, username="vietnam_ru",
+    channel = SimpleNamespace(id=2, access_hash=8, username="wildlife_ru",
                               title="Канал", megagroup=False, broadcast=True,
                               participants_count=51000, verified=True, scam=False)
     nameless = SimpleNamespace(id=3, access_hash=9, username=None, usernames=(),
@@ -3030,7 +3053,7 @@ def test_the_fake_transport_pages_by_add_offset_like_telegram_does():
     rows = [{"id": i, "date": None, "text": str(i), "author_id": None,
              "author_name": None, "author_username": None, "reply_to_id": None,
              "via": "mtproto"} for i in range(10)]
-    fake = account.FakeTransport().with_hits(7, "слово", rows, total=10)
+    fake = FakeTransport().with_hits(7, "слово", rows, total=10)
     peer = {"id": 7, "access_hash": 1}
     first = fake.search_messages(peer, "слово", limit=4, add_offset=0)
     second = fake.search_messages(peer, "слово", limit=4, add_offset=4)
@@ -3101,10 +3124,10 @@ def test_the_real_transport_builds_peer_records_out_of_the_chats_it_is_sent(monk
             # beside `username`, `type` and `participants`, so a group Telegram
             # has flagged for fraud would be admitted as clean and the next run
             # would read it as a source.
-            _StubChat(id=1931920118, access_hash=77, username="hanoi_chats",
+            _StubChat(id=1000000001, access_hash=77, username="birding_chats",
                       title="Big chat", megagroup=True, participants_count=2835,
                       scam=True),
-            _StubChat(id=42, access_hash=99, username="vietnam_ru",
+            _StubChat(id=42, access_hash=99, username="wildlife_ru",
                       title="News channel", megagroup=False, participants_count=51000,
                       verified=True),
             # No username: it cannot be linked, verified or re-found, so it is
@@ -3121,9 +3144,9 @@ def test_the_real_transport_builds_peer_records_out_of_the_chats_it_is_sent(monk
     finally:
         transport.close()
 
-    assert [r["username"] for r in rows] == ["hanoi_chats", "vietnam_ru"]
+    assert [r["username"] for r in rows] == ["birding_chats", "wildlife_ru"]
     assert rows[0]["type"] == "group" and rows[1]["type"] == "channel"
-    assert rows[0]["access_hash"] == 77 and rows[0]["id"] == 1931920118
+    assert rows[0]["access_hash"] == 77 and rows[0]["id"] == 1000000001
     assert rows[0]["participants"] == 2835
     assert rows[0]["scam"] is True and rows[0]["verified"] is False
     assert rows[1]["verified"] is True and rows[1]["scam"] is False
@@ -3150,7 +3173,7 @@ def test_the_real_transport_sends_the_query_and_the_offset_it_was_given(monkeypa
         # for 100. A field is only checked when its fixture value is one no
         # constant would produce by accident -- which is why `q` and `add_offset`
         # below were already catching their mutants and this line was not.
-        transport.search_messages({"id": 1931920118, "access_hash": 77},
+        transport.search_messages({"id": 1000000001, "access_hash": 77},
                                   "visaran", limit=37, add_offset=50)
     finally:
         transport.close()
@@ -3161,7 +3184,7 @@ def test_the_real_transport_sends_the_query_and_the_offset_it_was_given(monkeypa
     # The peer is a numeric InputPeerChannel, never a string Telethon would
     # resolve behind our back -- the rule the whole ledger rests on.
     assert isinstance(sent.peer, StubInputPeerChannel)
-    assert (sent.peer.channel_id, sent.peer.access_hash) == (1931920118, 77)
+    assert (sent.peer.channel_id, sent.peer.access_hash) == (1000000001, 77)
 
 
 def test_the_real_transport_reports_the_servers_total_not_the_page_size(monkeypatch):
@@ -3212,3 +3235,390 @@ def test_a_response_that_carries_no_count_is_its_own_total(monkeypatch):
     finally:
         transport.close()
     assert page["total"] == 2
+
+
+# --------------------------------------------------------------------------
+# `python scripts/account.py` on a console that is not UTF-8
+# --------------------------------------------------------------------------
+def test_the_status_command_prints_json_on_a_legacy_console(tmp_path):
+    """The docstring promises "never a traceback on stdout, never exit 1".
+
+    It held only on a UTF-8 console. `main()` printed with a bare `print` and
+    the status JSON carries an em dash -- so on cp437, cp850 or cp1252, the
+    default of an American Windows, the encoder raised `UnicodeEncodeError`:
+    a traceback, zero bytes of stdout and exit 1, which is the one code the
+    skill's table says must never be produced. cp1251 did not raise but wrote
+    cp1251 bytes, so redirecting the status to a file produced JSON that no
+    reader in this skill can parse.
+
+    `PYTHONIOENCODING` is the only portable way to put a legacy encoder on
+    stdout in a subprocess, and it is exactly what the fix overrides.
+    """
+    state = Path(tmp_path) / "state"
+    state.mkdir()
+    # A freeze reason is free text out of Telegram and out of `_freeze_seconds`:
+    # an em dash, and Cyrillic, neither of which cp1252 can encode.
+    (state / account.HISTORY_STATE_FILE).write_text(
+        json.dumps({"date": "2026-01-01", "requests": 1,
+                    "frozen_until": 0.0,
+                    "frozen_reason": "FloodWait — аренда квартиры"},
+                   ensure_ascii=False),
+        encoding="utf-8")
+    env = dict(os.environ)
+    env["TELEGRAM_RESEARCH_STATE"] = str(state)
+    env["PYTHONIOENCODING"] = "cp1252"
+    env.pop(account.ENV_ALLOW_LIVE, None)
+    done = subprocess.run([sys.executable, str(SCRIPTS / "account.py")],
+                          capture_output=True, env=env, timeout=120)
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+    payload = json.loads(done.stdout.decode("utf-8"))
+    assert "аренда квартиры" in json.dumps(payload, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# The history freeze: bounded, liftable, and tied to one boot
+# --------------------------------------------------------------------------
+def test_a_history_freeze_is_bounded_like_the_ledgers(tmp_path):
+    """`frozen_until` only grows and `_write_locked` refuses to shorten it, so
+    one bad number stopped every account call in every process for as long as it
+    said. Measured: a freeze of a billion seconds went to disk verbatim -- 31
+    years, with nothing in the skill able to lift it. The resolve ledger has had
+    a ceiling since the review; this copy did not."""
+    from resolve import MAX_FREEZE_SEC
+
+    log = account.HistoryLog(Path(tmp_path) / account.HISTORY_STATE_FILE)
+    log.freeze(1_000_000_000, "FloodWait on messages.getHistory")
+    assert log.frozen_for() <= MAX_FREEZE_SEC
+    reason = log.read()["frozen_reason"]
+    assert "clamped" in reason, reason
+    assert "--unfreeze" in reason, "the way out has to be named where it is read"
+
+
+def test_a_history_freeze_can_be_lifted_and_the_lift_is_recorded(tmp_path):
+    """There was no way to lift it at all: `frozen_until` only grows, every
+    write that would shorten it is refused, and the only repair left was
+    deleting the state file by hand -- which throws away the day's count of
+    account calls with it. The resolve ledger has `clear_freeze`; this did not.
+    """
+    path = Path(tmp_path) / account.HISTORY_STATE_FILE
+    log = account.HistoryLog(path)
+    log.record_request()
+    log.freeze(36468, "FloodWait on messages.getHistory")
+    assert log.frozen_for() > 36000
+
+    record = log.clear_freeze("cleared by hand: the clock was wrong")
+    assert record["was_frozen"] is True
+    assert record["recorded"] is True
+    assert record["cleared"]["frozen_for_sec"] > 36000
+    assert log.frozen_for() == 0
+    assert log.summary()["history_frozen"] is False
+    # The day's accounting survives the lift -- that is the whole point of
+    # having one rather than deleting the file.
+    assert log.read()["requests"] == 1
+
+    journal = path.with_name(path.name + ".freezes.jsonl")
+    line = json.loads(journal.read_text(encoding="utf-8").strip())
+    assert line["reason"] == "cleared by hand: the clock was wrong"
+    assert "FloodWait" in line["cleared"]["frozen_reason"]
+
+    # And a fresh reader of the same file agrees: the lift is on disk, not in
+    # the object that made it.
+    assert account.HistoryLog(path).frozen_for() == 0
+
+
+def test_lifting_a_history_freeze_that_is_not_there_says_so(tmp_path):
+    log = account.HistoryLog(Path(tmp_path) / account.HISTORY_STATE_FILE)
+    record = log.clear_freeze("nothing to lift")
+    assert record["was_frozen"] is False
+    assert log.frozen_for() == 0
+
+
+def test_a_history_freeze_does_not_survive_a_reboot(tmp_path):
+    """The same defect as the ledger's, in the copy that matters most: the
+    history freeze is the only one the CLI can really earn.
+
+    `mono_now >= mono_at_freeze` comes true again after ANY reboot, as soon as
+    the new uptime passes the old one, so the monotonic deadline was believed
+    again -- measured with a wall deadline three days expired and the freeze
+    still held. A reboot is simulated the only way it can be: the state carries
+    a previous boot's monotonic numbers and the boot estimate recorded beside
+    them does not match this machine's.
+    """
+    path = Path(tmp_path) / account.HISTORY_STATE_FILE
+    now = time.time()
+    boot_now = now - time.monotonic()
+    state = {
+        "date": account._day_of(now), "requests": 0,
+        "frozen_until": now - 3 * 86400,           # expired three days ago
+        "frozen_reason": "FloodWait on messages.getHistory",
+        "frozen_until_mono": time.monotonic() + 36468,
+        "mono_at_freeze": 100.0,
+        "boot_at_freeze": boot_now - 4 * 86400,    # another boot entirely
+        "last_request_ts": 0.0,
+    }
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert account.HistoryLog(path).frozen_for(now=now) == 0
+
+    state["boot_at_freeze"] = boot_now             # this boot: still frozen
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert account.HistoryLog(path).frozen_for(now=now) > 36000
+
+
+def test_a_history_freeze_records_which_boot_it_belongs_to(tmp_path):
+    log = account.HistoryLog(Path(tmp_path) / account.HISTORY_STATE_FILE)
+    log.freeze(600, "FloodWait on messages.getHistory")
+    state = log.read()
+    assert state["frozen_until_mono"] > 0
+    assert abs(state["boot_at_freeze"] - (time.time() - time.monotonic())) < 5.0
+
+
+# --------------------------------------------------------------------------
+# Pacing survives the end of the process
+# --------------------------------------------------------------------------
+def test_the_gap_between_account_calls_survives_a_new_process(tmp_path):
+    """`_pace_history` read a module global, which a new interpreter starts at
+    zero -- and the agent drives this skill as a series of separate `tg.py`
+    runs, so the FIRST account call of every run went out with no pause at all.
+    Three commands in a row were a burst, which is the one shape that has ever
+    cost this account downtime. The stamp is on disk now.
+    """
+    cfg = make_cfg(tmp_path)
+    cfg.budgets.min_gap_sec = 30.0
+    log = account.HistoryLog(Path(cfg.state_dir) / account.HISTORY_STATE_FILE)
+    log.record_request()
+    assert log.read()["last_request_ts"] > 0
+    assert log.summary()["last_request_ts"] > 0
+
+    # A brand-new process: nothing in the globals, everything on disk.
+    account.reset_history_requests_this_process()
+    assert account.last_history_ts_this_process() == 0.0
+    sleeps: list = []
+    session = make_session(tmp_path, cfg=cfg, sleeps=sleeps)
+    session._pace_history()
+    assert sleeps and 0 < sleeps[0] <= 30.0, sleeps
+
+
+def test_a_pacing_stamp_from_a_clock_that_ran_ahead_does_not_park_the_run(tmp_path):
+    """The stamp is durable now, so a clock that was fast when it was written
+    would otherwise leave every later run asleep until the clock caught up."""
+    cfg = make_cfg(tmp_path)
+    cfg.budgets.min_gap_sec = 30.0
+    log = account.HistoryLog(Path(cfg.state_dir) / account.HISTORY_STATE_FILE)
+    log.record_request(now=time.time() + 10 * 86400)
+    sleeps: list = []
+    make_session(tmp_path, cfg=cfg, sleeps=sleeps)._pace_history()
+    assert sleeps and sleeps[0] <= 30.0, sleeps
+
+
+def test_an_unreadable_history_file_does_not_break_pacing(tmp_path):
+    """`_history_stop_reason` has already refused on the same file, with a
+    sentence. Pacing must not turn that into an exception of its own."""
+    cfg = make_cfg(tmp_path)
+    cfg.budgets.min_gap_sec = 30.0
+    (Path(cfg.state_dir) / account.HISTORY_STATE_FILE).write_text(
+        "not json", encoding="utf-8")
+    sleeps: list = []
+    make_session(tmp_path, cfg=cfg, sleeps=sleeps)._pace_history()
+    assert sleeps == []
+
+
+# --------------------------------------------------------------------------
+# The connection is opened inside the lock
+# --------------------------------------------------------------------------
+class ConnectingTransport(FakeTransport):
+    """A transport that has to be connected, and says when it was."""
+
+    def __init__(self, lock_path=None):
+        super().__init__()
+        self.connected = False
+        self.lock_existed_at_connect = None
+        self._lock_path = lock_path
+
+    def connect(self):
+        self.connected = True
+        if self._lock_path is not None:
+            self.lock_existed_at_connect = Path(self._lock_path).exists()
+        return self
+
+
+def test_a_live_session_connects_the_transport_after_it_has_the_lock(tmp_path):
+    """The class docstring promises the whole session runs inside `AccountLock`,
+    and the connection did not: the caller connected first and entered
+    afterwards, so the MTProto handshake and `is_user_authorized` -- two real
+    calls on the identity -- happened before anything checked whether another
+    process already held the account.
+    """
+    cfg = make_cfg(tmp_path)
+    transport = ConnectingTransport(cfg.lock_path)
+    with make_session(tmp_path, transport, live=True, cfg=cfg):
+        assert transport.connected is True
+    assert transport.lock_existed_at_connect is True, (
+        "the wire was opened before the account lock was taken")
+
+
+def test_a_busy_account_never_reaches_the_wire(tmp_path):
+    """The consequence the lock exists for: a second run against a busy account
+    used to authorise a second connection and spend two calls on the identity
+    before `AccountBusy` reached it."""
+    cfg = make_cfg(tmp_path)
+    holder = account.AccountSession(
+        FakeTransport(), cfg=cfg, ledger=make_ledger(cfg), fingerprint=FP,
+        lock=AccountLock(cfg.lock_path),
+    )
+    transport = ConnectingTransport(cfg.lock_path)
+    with holder:
+        second = make_session(tmp_path, transport, live=True, cfg=cfg)
+        with pytest.raises(AccountBusy):
+            second.__enter__()
+    assert transport.connected is False
+
+
+def test_a_transport_that_is_already_connected_is_left_alone(tmp_path):
+    """Compatibility: a caller that connects for itself keeps working, and
+    nothing is connected twice."""
+    cfg = make_cfg(tmp_path)
+
+    class AlreadyOpen(ConnectingTransport):
+        def __init__(self):
+            super().__init__()
+            self.connected = True
+            self.connects = 0
+
+        def connect(self):
+            self.connects += 1
+            return self
+
+    transport = AlreadyOpen()
+    with make_session(tmp_path, transport, live=True, cfg=cfg):
+        pass
+    assert transport.connects == 0
+
+
+def test_a_dry_run_connects_nothing(tmp_path):
+    transport = ConnectingTransport()
+    with make_session(tmp_path, transport):
+        pass
+    assert transport.connected is False
+
+
+def test_a_connection_that_fails_does_not_leave_the_account_locked(tmp_path):
+    cfg = make_cfg(tmp_path)
+
+    class Refuses(ConnectingTransport):
+        def connect(self):
+            raise account.TransportError("connecting to Telegram failed")
+
+    session = make_session(tmp_path, Refuses(), live=True, cfg=cfg)
+    with pytest.raises(account.TransportError):
+        session.__enter__()
+    # The next run gets the account, rather than a lock nobody holds.
+    with make_session(tmp_path, FakeTransport(), live=True, cfg=cfg):
+        pass
+
+
+# --------------------------------------------------------------------------
+# The join budget is taken before the call, not after it
+# --------------------------------------------------------------------------
+def test_a_join_is_charged_before_the_request_leaves(tmp_path):
+    """The count used to be taken in handlers that catch `Exception` and
+    `BaseException`. Those see Ctrl-C and a supervisor's timeout; they do not
+    see `SIGKILL`, `taskkill /f` or a power cut, because none of those runs a
+    handler at all. Three killed processes joined three real groups with
+    `joins_today: 0` on disk and the ceiling of 3 untouched.
+    """
+    cfg = make_cfg(tmp_path)
+    ledger = make_ledger(cfg, join_ceiling=3)
+    seen = {}
+
+    class KilledMidJoin(FakeTransport):
+        def join_group(self, peer, *, options=None):
+            # What a process killed here would leave behind on disk.
+            seen["joins_at_call_time"] = ledger.read().joins
+            raise KeyboardInterrupt
+
+    with make_session(tmp_path, KilledMidJoin(), live=True, cfg=cfg,
+                      ledger=ledger) as live:
+        with pytest.raises(KeyboardInterrupt):
+            live.join_group(req(), good_peer())
+    assert seen["joins_at_call_time"] == 1, (
+        "the join was on the wire with nothing charged for it")
+    assert ledger.read().joins == 1, "and it must not be charged twice"
+
+
+def test_a_successful_join_is_charged_exactly_once(tmp_path):
+    cfg = make_cfg(tmp_path)
+    ledger = make_ledger(cfg, join_ceiling=3)
+    fake = FakeTransport()
+    with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
+        assert live.join_group(req(), good_peer())["joined"] is True
+    assert ledger.read().joins == 1
+    assert len(fake.join_calls) == 1
+
+
+def test_a_local_refusal_still_charges_no_join(tmp_path):
+    """Everything that can refuse on this machine happens before the
+    reservation: a refused join is not a spent one."""
+    cfg = make_cfg(tmp_path)
+    ledger = make_ledger(cfg, join_ceiling=3)
+    fake = FakeTransport()
+    with make_session(tmp_path, fake, live=True, cfg=cfg, ledger=ledger) as live:
+        with pytest.raises(account.PeerUnusable):
+            live.join_group(req(), {"id": "@tdlibchat", "access_hash": 1,
+                                    "auth_session_fingerprint": FP})
+    assert ledger.read().joins == 0
+    assert fake.join_calls == []
+
+
+# --------------------------------------------------------------------------
+# The peer cache: one spelling of a name
+# --------------------------------------------------------------------------
+def test_a_peer_stored_under_an_at_sign_can_still_be_found(tmp_path):
+    """`put` wrote the key verbatim and `get`/`drop` read it with the `@`
+    stripped, so a row stored as `@name` -- which is how a transport that echoes
+    the requested name spells it -- could never be found or dropped again. The
+    cache paid for a peer, kept it, and bought the same one over the budget the
+    next time it was asked."""
+    cache = account.PeerCache(Path(tmp_path) / account.PEER_CACHE_FILE)
+    assert cache.put([{"username": "@tdlibchat", "id": 1, "access_hash": 2}], FP) == 1
+    assert cache.get("tdlibchat", FP) is not None
+    assert cache.get("@tdlibchat", FP) is not None
+    assert cache.drop("@tdlibchat") is True
+    assert cache.get("tdlibchat", FP) is None
+
+
+def test_a_cache_file_written_with_at_signs_is_readable(tmp_path):
+    """The rows already on disk are the reason the normalisation is in `read`
+    as well as in `put`."""
+    path = Path(tmp_path) / account.PEER_CACHE_FILE
+    path.write_text(json.dumps({"peers": {"@tdlibchat": {
+        "username": "@tdlibchat", "id": 1, "access_hash": 2,
+        "auth_session_fingerprint": FP}}}), encoding="utf-8")
+    assert account.PeerCache(path).get("tdlibchat", FP) is not None
+
+
+# --------------------------------------------------------------------------
+# What a refusal reports as spent
+# --------------------------------------------------------------------------
+def test_a_refusal_after_the_first_flood_reports_no_request(tmp_path):
+    """`requests=1 if self._flood_stop else 0` read a RUN-LOCAL LATCH as if it
+    described this call. Once the first FloodWait had set it, every later
+    refusal -- taken locally, before `_require_live`, with nothing on the wire
+    -- reported one account call against the identity. The number a caller adds
+    up to decide whether it is safe to go on was wrong in the dangerous
+    direction."""
+    cfg = make_cfg(tmp_path)
+    fake = FakeTransport().with_history(1006503122, [{"id": 1}])
+    fake.floods["history"] = 36468
+    with make_session(tmp_path, fake, live=True, cfg=cfg) as live:
+        first = live.history(req(), good_peer())
+        assert first.requests == 1, "the flooded call did leave the machine"
+        assert live._flood_stop is True
+
+        second = live.history(req(), good_peer())
+        assert second.stopped
+        assert second.requests == 0, "nothing was sent for the second one"
+
+        contacts = live.search_contacts("tdlib")
+        assert contacts["stopped"] and contacts["requests"] == 0
+        search = live.search_messages("tdlibchat", good_peer(), "виза")
+        assert search["stopped"] and search["requests"] == 0

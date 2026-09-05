@@ -3,7 +3,7 @@
 No live fixture captures a multi-page channel walk or a group with a
 controlled gap (the probes are single snapshots, not a crawl), so several
 tests here reuse two or more real saved bodies at different mapped URLs --
-`read_group_message`/`parse_embed` only look at body content, never at the
+`_fetch_group_message`/`parse_embed` only look at body content, never at the
 URL that was requested, so this is honest reuse, not invented content. Every
 number asserted below was produced by running these exact functions against
 these exact mappings first.
@@ -14,12 +14,13 @@ every one of them passed while the function returned 7, 41, 67, 92, 549, 680
 or nothing at all for a real group whose newest id was 29 327. The generator
 below occupies ids at the 1.7 % measured live -- 3 messages across 175
 consecutive ids, with a forced 124-id run of empties between two live ones,
-exactly as `hanoi_chats` served on 2026-08-24.
+exactly as `birding_chats` served on 2026-08-24.
 """
 
 from __future__ import annotations
 
 import random
+import re
 
 import pytest
 
@@ -27,6 +28,9 @@ import read
 import tgparse
 import tgweb
 from conftest import FakeWeb, embed_url, preview_url
+
+# The opening tag of a message block, as tgparse counts them.
+WRAP_START = '<div class="tgme_widget_message_wrap'
 
 
 # --------------------------------------------------------------------------
@@ -184,28 +188,28 @@ def test_walk_channel_302_raises_wrong_route(probe):
     # comes with it is empty -- measured live, on a saved probe that did not
     # travel with the public copy of the corpus.
     web = FakeWeb({
-        preview_url("hanoi_chats", before=None): tgweb.Response(
-            url=preview_url("hanoi_chats", before=None),
+        preview_url("birding_chats", before=None): tgweb.Response(
+            url=preview_url("birding_chats", before=None),
             status=302,
             body="",
-            location="https://t.me/hanoi_chats",
+            location="https://t.me/birding_chats",
         ),
     })
     with pytest.raises(read.WrongRoute):
-        read.walk_channel(web, "hanoi_chats")
+        read.walk_channel(web, "birding_chats")
 
 
 def test_search_channel_302_raises_wrong_route():
     web = FakeWeb({
-        preview_url("hanoi_chats", query="word"): tgweb.Response(
-            url=preview_url("hanoi_chats", query="word"),
+        preview_url("birding_chats", query="word"): tgweb.Response(
+            url=preview_url("birding_chats", query="word"),
             status=302,
             body="",
-            location="https://t.me/hanoi_chats",
+            location="https://t.me/birding_chats",
         ),
     })
     with pytest.raises(read.WrongRoute):
-        read.search_channel(web, "hanoi_chats", "word")
+        read.search_channel(web, "birding_chats", "word")
 
 
 # --------------------------------------------------------------------------
@@ -348,9 +352,9 @@ def test_search_channel_found_nothing():
 
 
 # --------------------------------------------------------------------------
-# read_group_message -- one request, real hit and real miss bodies
+# _fetch_group_message -- one request, real hit and real miss bodies
 # --------------------------------------------------------------------------
-def test_read_group_message_hit(probe):
+def test_fetch_group_message_hit(probe):
     """A11: the assertion here used to be `msg is not None`.
 
     This is the most expensive read path in the skill -- one HTTP GET per
@@ -359,14 +363,14 @@ def test_read_group_message_hit(probe):
     promises a permalink, a date verbatim from the page, the text and the
     author, so those are what this asserts, against the real saved page.
     """
-    body = probe("C26-embed-hanoi-29327.html")
-    web = FakeWeb({embed_url("hanoi_chats", 29327): {"status": 200, "body": body}})
-    msg = read.read_group_message(web, "hanoi_chats", 29327)
+    body = probe("C26-embed-birding-29327.html")
+    web = FakeWeb({embed_url("birding_chats", 29327): {"status": 200, "body": body}})
+    msg, _ = read._fetch_group_message(web, "birding_chats", 29327)
 
     assert msg is not None
-    assert msg.username == "hanoi_chats"
+    assert msg.username == "birding_chats"
     assert msg.id == 29327
-    assert msg.url == "https://t.me/hanoi_chats/29327"
+    assert msg.url == "https://t.me/birding_chats/29327"
     assert msg.date == "2026-08-22T17:58:18+00:00"
     assert msg.text == "Hi"
     assert msg.author_name == "Author Five"
@@ -374,17 +378,17 @@ def test_read_group_message_hit(probe):
     assert msg.found_by is None          # no query was behind this read
 
 
-def test_read_group_message_miss(probe):
-    body = probe("C16-embed-hanoi-10000.html")
-    web = FakeWeb({embed_url("hanoi_chats", 10000): {"status": 200, "body": body}})
-    msg = read.read_group_message(web, "hanoi_chats", 10000)
+def test_fetch_group_message_miss(probe):
+    body = probe("C16-embed-birding-10000.html")
+    web = FakeWeb({embed_url("birding_chats", 10000): {"status": 200, "body": body}})
+    msg, _ = read._fetch_group_message(web, "birding_chats", 10000)
     assert msg is None
 
 
 # --------------------------------------------------------------------------
 # The measured group surface: 1.7 % density, a forced 124-id run of empties
 # --------------------------------------------------------------------------
-TRUE_HEAD = 29327          # what hanoi_chats actually served on 2026-08-24
+TRUE_HEAD = 29327          # what birding_chats actually served on 2026-08-24
 MEASURED_DENSITY = 0.017   # 3 messages across 175 consecutive ids
 
 
@@ -403,14 +407,14 @@ def _sparse_group(seed: int, head: int = TRUE_HEAD,
 def _gapped_web(probe, occupied):
     """Serves the real hit page and the real "Post not found" page, per id.
 
-    The hit body is `C16-embed-hanoi-1.html` with the single `data-post`
+    The hit body is `C16-embed-birding-1.html` with the single `data-post`
     attribute rewritten to the id being asked about; the miss body is
-    `C26-embed-hanoi-29320.html` untouched. Nothing else about either page is
+    `C26-embed-birding-29320.html` untouched. Nothing else about either page is
     synthetic -- and the two are byte-identical in every respect that could
     distinguish "deleted" from "past the end", which is the whole problem.
     """
-    miss_body = probe("C26-embed-hanoi-29320.html")
-    hit_body = probe("C16-embed-hanoi-1.html")
+    miss_body = probe("C26-embed-birding-29320.html")
+    hit_body = probe("C16-embed-birding-1.html")
 
     class GappedGroupWeb:
         def __init__(self):
@@ -422,8 +426,8 @@ def _gapped_web(probe, occupied):
             self.request_count += 1
             self.asked.append(mid)
             if mid in occupied:
-                body = hit_body.replace('data-post="hanoi_chats/1"',
-                                        f'data-post="hanoi_chats/{mid}"')
+                body = hit_body.replace('data-post="birding_chats/1"',
+                                        f'data-post="birding_chats/{mid}"')
             else:
                 body = miss_body
             return tgweb.Response(
@@ -829,7 +833,7 @@ def test_a_ceiling_that_is_not_a_finite_number_is_refused_by_name(bad):
     with pytest.raises(read.NothingAsked):
         read.search_channel(web, "durov", "arenda", max_pages=bad)
     with pytest.raises(read.NothingAsked):
-        read.read_group_message(web, "hanoi_chats", bad)
+        read._fetch_group_message(web, "birding_chats", bad)
     assert web.calls == [], "a refusal must not spend a request"
 
 
@@ -850,3 +854,151 @@ def test_a_damaged_budget_in_config_falls_back_instead_of_crashing(monkeypatch):
 
     monkeypatch.setattr("config.Budgets", _Boolean)
     assert read._budget("max_pages_per_channel", 25) == 25
+
+
+# --------------------------------------------------------------------------
+# A `?q=` page carrying no message blocks is not a finished search
+# --------------------------------------------------------------------------
+def test_a_q_page_with_no_message_blocks_is_not_a_completed_search():
+    """The false zero in the shape of a real ending, on the search route.
+
+    `walk_channel` has always stopped on a `/s/` page that carries no message
+    block (`preview_available`); `search_channel` had no such branch, so the
+    page fell through to the cursor test and ended the search as
+    `no_more_pages`: `found: 0, exhausted: true, found_nothing: false` -- the
+    output of a query that ran to the end of the matches. Nothing about such a
+    page says the query matched nothing: the zero-hit marker is what says that,
+    and it is not there either.
+    """
+    body = "<html><body><div class='tgme_channel_history'></div></body></html>"
+    web = FakeWeb({preview_url("durov", query="bitcoin"): {"status": 200, "body": body}})
+    result = read.search_channel(web, "durov", "bitcoin")
+
+    assert result.requests == 1
+    assert len(result.messages) == 0
+    assert result.exhausted is False          # nothing here ran out of anything
+    assert result.found_nothing is False
+    assert result.stop_reason == "no_messages"
+    assert result.stopped_early is not None
+    assert result.no_more_pages is False
+
+
+def test_the_zero_hit_marker_still_answers_for_itself():
+    # The control: a page that DOES carry the surface's own no-hits marker is
+    # proven silence, and the branch above must not have taken that away.
+    body = f'<html><body><div class="{tgweb.NO_MESSAGES_FOUND}">No results</div></body></html>'
+    web = FakeWeb({preview_url("durov", query="zzznohitszzz"): {"status": 200, "body": body}})
+    result = read.search_channel(web, "durov", "zzznohitszzz")
+    assert (result.found_nothing, result.exhausted) == (True, True)
+    assert result.stop_reason == "found_nothing"
+
+
+# --------------------------------------------------------------------------
+# An unreadable ?embed=1 page is not a proven empty id
+# --------------------------------------------------------------------------
+def test_a_page_that_is_neither_a_message_nor_an_absence_is_not_a_miss():
+    """`tgweb.embed_unreadable`'s third answer, which was being given as a miss.
+
+    A front-end change, a join wall or an interstitial produces a page with no
+    message and no "post not found" marker. Booked as `missing`, a run of them
+    is a run of PROVEN empty ids -- and a group walk ends on that saying the
+    history stops here, about a group that is still talking.
+    """
+    wall = ("<html><body><div class='tgme_page_wrap'>Join this group to view "
+            "its messages</div></body></html>")
+    web = FakeWeb({embed_url("birding_chats", 29327): {"status": 200, "body": wall}})
+    msg, verdict = read._fetch_group_message(web, "birding_chats", 29327)
+
+    assert msg is None
+    assert verdict == "unreadable"
+
+
+def test_a_real_post_not_found_page_is_still_a_miss(probe):
+    # The control, on a real saved error page: a gap in a group's ids is
+    # ordinary and must stay distinguishable from a page we could not read.
+    body = probe("C16-embed-birding-10000.html")
+    web = FakeWeb({embed_url("birding_chats", 10000): {"status": 200, "body": body}})
+    assert read._fetch_group_message(web, "birding_chats", 10000) == (None, "missing")
+
+
+# --------------------------------------------------------------------------
+# "was the first page full" is asked the way tgparse asks it
+# --------------------------------------------------------------------------
+def test_a_first_page_with_unparsed_blocks_is_still_a_full_page(probe):
+    """Three blocks that did not parse turned a capped search into a finished one.
+
+    `PreviewPage.is_full` counts ids OR blocks, whichever is larger, because an
+    album is one block with several ids and a block that failed to parse is a
+    block all the same. This module counted the ids alone, so a page of 20
+    blocks of which 3 were unreadable came back "short", and a `?q=` surface
+    that had truncated its own output was reported as `exhausted: true` -- all
+    the matches are in.
+    """
+    body = probe("C03-s-durov-q.html")
+    starts = [m.start() for m in re.finditer(re.escape(WRAP_START), body)]
+    assert len(starts) == 20, "C03 no longer carries twenty blocks"
+    broken = body[:starts[17]] + body[starts[17]:].replace("data-post=", "data-postid=")
+
+    web = FakeWeb({
+        preview_url("durov", query="bitcoin"): {"status": 200, "body": broken},
+        # the surface stops serving: the next page repeats what is in hand
+        preview_url("durov", query="bitcoin", before=517): {"status": 200, "body": broken},
+    })
+    result = read.search_channel(web, "durov", "bitcoin")
+
+    assert result.ids_seen == 17 and result.blocks_unparsed == 6   # 3 per page
+    assert result.surface_truncated is True
+    assert result.exhausted is False              # this is a CAP, not an ending
+    assert result.stop_reason == "surface_cap"
+    assert "surface's own cap" in result.stopped_early
+
+
+# --------------------------------------------------------------------------
+# understood_nothing has two shapes and they read differently
+# --------------------------------------------------------------------------
+def test_the_two_shapes_of_understood_nothing_are_reported_apart(probe):
+    """One sentence described both, and it described the other one's cause.
+
+    Shape one: no block parsed at all -- `data-post` moved. Shape two: every
+    block parsed and not one carries a word -- the text selector moved. Telling
+    the reader "not one of them parsed" in the second case sends whoever
+    repairs it to look at `data-post`, which is the half that still works.
+    """
+    body = probe("A01-s-durov.html")
+
+    nothing_parsed = body.replace("data-post=", "data-postid=")
+    web = FakeWeb({preview_url("durov", before=None): {"status": 200, "body": nothing_parsed}})
+    first = read.walk_channel(web, "durov", max_pages=3)
+    assert first.understood_nothing is True
+    assert first.stop_reason == "understood_nothing"
+    assert "not one of them parsed" in first.stopped_early
+
+    no_text = body.replace(tgparse.SEL["msg_text"], "x")
+    web = FakeWeb({preview_url("durov", before=None): {"status": 200, "body": no_text}})
+    second = read.walk_channel(web, "durov", max_pages=3)
+    assert second.understood_nothing is True
+    assert second.stop_reason == "understood_nothing"
+    assert "text selector has moved" in second.stopped_early
+    assert "not one of them parsed" not in second.stopped_early
+
+
+def test_a_full_page_of_captionless_media_does_not_stop_a_walk(probe):
+    """The walk's side of the same verdict: it discards the page it stops on.
+
+    A channel that posts pictures without captions served a page every block of
+    which parsed, and the walk stopped calling it a front-end change -- twenty
+    correctly parsed posts thrown away, and a change reported that had not
+    happened.
+    """
+    body = probe("A01-s-durov.html")
+    media_everywhere = (body.replace(tgparse.SEL["msg_text"], "x")
+                            .replace(tgparse.SEL["bubble"], tgparse.SEL["photo"]))
+    web = FakeWeb({
+        preview_url("durov", before=None): {"status": 200, "body": media_everywhere},
+        preview_url("durov", before=523): {"status": 200, "body": media_everywhere},
+    })
+    result = read.walk_channel(web, "durov", max_pages=2)
+
+    assert result.understood_nothing is False
+    assert len(result.messages) == 20
+    assert result.stop_reason == "no_more_pages"      # an ordinary ending

@@ -198,7 +198,7 @@ def test_service_messages_across_the_whole_probe_corpus(fixtures):
         ("A09-s-Astana_motoriders.html", "Astana_motoriders/97"),      # pinned event
         ("C07-embed-tdlibchat-1.html", "tdlibchat/1"),
         ("C11-embed-tdlibchat-100000.html", "tdlibchat/100000"),
-        ("C16-embed-hanoi-1.html", "hanoi_chats/1"),
+        ("C16-embed-birding-1.html", "birding_chats/1"),
     ]
 
 
@@ -249,9 +249,9 @@ def test_text_only_posts_carry_no_media_urls(probe):
 def test_an_animated_profile_photo_is_not_the_posts_media(probe):
     # C16/1000 is one line of text. The .mp4 that used to land in media_urls is
     # the SENDER's animated profile photo, inside tgme_widget_message_user_photo.
-    body = probe("C16-embed-hanoi-1000.html")
-    m = tgparse.parse_embed(body, "hanoi_chats", 1000)
-    assert m.text == "Едальни без дверей, это они?"
+    body = probe("C16-embed-birding-1000.html")
+    m = tgparse.parse_embed(body, "birding_chats", 1000)
+    assert m.text == "The hides with no doors, is that the ones?"
     assert m.media == []
     assert m.media_urls == []
 
@@ -263,7 +263,7 @@ def test_an_animated_profile_photo_is_not_the_posts_media(probe):
     live = re.sub(r'src="data:video/mp4[^"]*"',
                   'src="https://cdn4.telesco.pe/file/animated-avatar.mp4"', body)
     assert "cdn4.telesco.pe/file/animated-avatar.mp4" in live
-    m = tgparse.parse_embed(live, "hanoi_chats", 1000)
+    m = tgparse.parse_embed(live, "birding_chats", 1000)
     assert m.media == []
     assert m.media_urls == []
 
@@ -362,9 +362,9 @@ def test_forward_paging_reads_the_rel_next_link(probe):
 # data-peer -- a group's only id on this surface
 # --------------------------------------------------------------------------
 def test_group_embed_carries_a_chat_peer(probe):
-    m = tgparse.parse_embed(probe("C16-embed-hanoi-1000.html"), "hanoi_chats", 1000)
+    m = tgparse.parse_embed(probe("C16-embed-birding-1000.html"), "birding_chats", 1000)
     assert m.chat_id is None                     # no data-view on a group embed
-    assert m.chat_peer == "c1931920118_4774030320557415984"
+    assert m.chat_peer == "c1000000001_4000000000000000001"
 
 
 def test_channel_embed_data_peer_agrees_with_data_view(probe):
@@ -506,10 +506,10 @@ def test_an_unreadable_embed_is_not_an_empty_id(probe, capsys):
     """
     wall = "<html><body><div class='joinwall'>Join this group to see it</div></body></html>"
     assert tgweb.embed_unreadable(wall) is True
-    assert tgparse.parse_embed(wall, "hanoi_chats", 29327) is None
+    assert tgparse.parse_embed(wall, "birding_chats", 29327) is None
     assert "neither a message nor" in capsys.readouterr().err
     # and a real page is not confused with one
-    assert tgweb.embed_unreadable(probe("C26-embed-hanoi-29327.html")) is False
+    assert tgweb.embed_unreadable(probe("C26-embed-birding-29327.html")) is False
     assert tgweb.embed_unreadable(probe("C08-embed-tdlibchat-50000.html")) is False
 
 
@@ -520,11 +520,11 @@ def test_parse_embed_records_that_it_got_a_different_post(probe):
     the same `data-post` -- which is exactly why this was invisible: the walk
     that asked for id N booked a hit for N and filed a post with another id.
     """
-    body = probe("C16-embed-hanoi-1000.html")
-    asked = tgparse.parse_embed(body, "hanoi_chats", 1000)
+    body = probe("C16-embed-birding-1000.html")
+    asked = tgparse.parse_embed(body, "birding_chats", 1000)
     assert asked.id == 1000 and asked.requested_id is None
 
-    served = tgparse.parse_embed(body, "hanoi_chats", 999999)
+    served = tgparse.parse_embed(body, "birding_chats", 999999)
     assert served.id == 1000                       # nothing is dropped
     assert served.requested_id == 999999           # and nothing is hidden
 
@@ -548,14 +548,14 @@ def test_a_broken_data_view_does_not_take_down_the_page(probe):
 
 
 def test_embed_post_not_found_returns_none(probe):
-    assert tgparse.parse_embed(probe("C26-embed-hanoi-29320.html"), "hanoi_chats", 29320) is None
+    assert tgparse.parse_embed(probe("C26-embed-birding-29320.html"), "birding_chats", 29320) is None
 
 
 def test_embed_live_group_message_no_username(probe):
     # C26-29327: the author carries no public username at all -- author
     # identity on this surface is display name always, username sometimes,
     # user id never (tgparse.py module docstring).
-    m = tgparse.parse_embed(probe("C26-embed-hanoi-29327.html"), "hanoi_chats", 29327)
+    m = tgparse.parse_embed(probe("C26-embed-birding-29327.html"), "birding_chats", 29327)
     assert m is not None
     assert m.author_name == "Author Five"
     assert m.author_username is None
@@ -656,7 +656,7 @@ def test_real_parsed_messages_never_carry_a_user_id_key(probe):
     sources = [
         ("A01-s-durov.html", "preview", "durov"),
         ("C10-embed-tdlibchat-10000.html", "embed", "tdlibchat"),
-        ("C26-embed-hanoi-29327.html", "embed", "hanoi_chats"),
+        ("C26-embed-birding-29327.html", "embed", "birding_chats"),
     ]
     for name, kind, username in sources:
         body = probe(name)
@@ -1029,9 +1029,9 @@ def test_a_recognised_missing_post_says_nothing_on_stderr(probe, capsys):
     `--count 50` fires it on ~98 % of the ids it tries, and the one alarm that
     matters becomes noise nobody reads.
     """
-    for name in ("C26-embed-hanoi-29320.html", "C08-embed-tdlibchat-50000.html"):
+    for name in ("C26-embed-birding-29320.html", "C08-embed-tdlibchat-50000.html"):
         capsys.readouterr()
-        assert tgparse.parse_embed(probe(name), "hanoi_chats", 29320) is None
+        assert tgparse.parse_embed(probe(name), "birding_chats", 29320) is None
         assert capsys.readouterr().err == "", name
 
 
@@ -1093,3 +1093,145 @@ def test_the_cursor_is_the_smallest_id_the_page_accounted_for(probe):
     assert page.ids_seen == 20
     assert page.before == 523
     assert page.before_is_fallback is True
+
+
+# --------------------------------------------------------------------------
+# The album href, in the three forms a page may serve it in
+# --------------------------------------------------------------------------
+def _album_block(username: str, mid: int, hrefs: list[str]) -> str:
+    """One message block whose grouped wrapper carries exactly these hrefs."""
+    items = "".join('<a href="%s">x</a>' % href for href in hrefs)
+    return (
+        '<div class="tgme_widget_message_wrap">'
+        '<div class="tgme_widget_message" data-post="%s/%d">'
+        '<div class="tgme_widget_message_grouped_wrap js-message_grouped_wrap">'
+        "%s</div></div></div>" % (username, mid, items)
+    )
+
+
+@pytest.mark.parametrize("href", [
+    "https://t.me/durov/524?single",
+    "http://t.me/durov/524?single",
+    "//t.me/durov/524?single",          # protocol-relative
+    "/durov/524?single",                # site-relative
+])
+def test_an_album_id_is_found_whichever_form_the_link_takes(href):
+    """Only the absolute form was matched, and the loss was silent.
+
+    A relative or protocol-relative `?single` href is the same link to the same
+    item, and dropping it drops an id that exists nowhere else in the markup --
+    with `blocks_unparsed` at 0, because the block itself parsed perfectly.
+    This branch has no fixture in the corpus (`grep -l grouped` matches one
+    documentation page), which is exactly why the parser must accept every form
+    the surface is free to serve rather than the one that was seen once.
+    """
+    page = tgparse.parse_preview(_album_block("durov", 523, [href]), "durov")
+    assert page.messages[0].ids == [523, 524]
+    assert page.ids_seen == 2
+
+
+def test_an_album_id_survives_the_channel_name_in_another_case():
+    """`BirdingChats` and `birding_chats`' neighbours are one peer, not two.
+
+    The name in the href is whatever case the link was written in, and the
+    comparison was exact -- so a page that capitalised its own name lost every
+    album id it carried.
+    """
+    page = tgparse.parse_preview(
+        _album_block("durov", 523, ["https://t.me/DuRoV/524?single"]), "durov"
+    )
+    assert page.messages[0].ids == [523, 524]
+
+
+def test_a_relative_href_to_another_channel_is_still_refused():
+    # The other half of the rule: only ids under the same username are taken.
+    page = tgparse.parse_preview(
+        _album_block("durov", 523, ["/someoneelse/999?single",
+                                    "https://example.com/durov/777?single"]),
+        "durov",
+    )
+    assert page.messages[0].ids == [523]
+
+
+# --------------------------------------------------------------------------
+# A full page of caption-less media is a channel that posts pictures
+# --------------------------------------------------------------------------
+def test_a_full_page_of_captionless_media_is_not_a_front_end_change(probe):
+    """`understood_nothing` stops a walk and throws the page away.
+
+    A page of twenty photos with no captions carries no text and never did, and
+    it used to come back `understood_nothing: true` -- the walk stopped, the
+    twenty correctly parsed posts were discarded, and the run reported a
+    front-end change that had not happened. The mutation below is A01 with its
+    text selector renamed AND every message given a photo, which is the shape
+    such a page has: every block yielded something.
+    """
+    body = probe("A01-s-durov.html")
+    media_everywhere = (body.replace(tgparse.SEL["msg_text"], "x")
+                            .replace(tgparse.SEL["bubble"], tgparse.SEL["photo"]))
+    page = tgparse.parse_preview(media_everywhere, "durov")
+
+    assert len(page.messages) == 20
+    assert page.is_full is True
+    assert [m.text for m in page.messages] == [""] * 20
+    assert all(m.media for m in page.messages)
+    assert page.no_message_carries_text is False
+    assert page.understood_nothing is False
+
+
+def test_a_page_where_a_block_yielded_nothing_at_all_is_still_a_change(probe):
+    """The other side of the same test, and why it is `all` and not `any`.
+
+    When the text selector moves, the posts that carried media still have it --
+    A01 renamed is 8 media posts and 12 records with nothing in them -- so a
+    single photo on the page would have been enough to wave the rename through
+    if media were merely counted somewhere on the page.
+    """
+    broken = tgparse.parse_preview(
+        probe("A01-s-durov.html").replace(tgparse.SEL["msg_text"], "x"), "durov"
+    )
+    assert sum(1 for m in broken.messages if m.media) == 8      # not zero
+    assert sum(1 for m in broken.messages if not m.media) == 12
+    assert broken.understood_nothing is True
+
+
+# --------------------------------------------------------------------------
+# small parsers: a grouped count, and a CSS url with a bracket in it
+# --------------------------------------------------------------------------
+def test_a_reaction_count_may_carry_a_space_inside_the_number():
+    """Telegram groups thousands with a narrow no-break space.
+
+    `👍 1 234` matched nothing, so the whole label became the key and the count
+    came out empty: the reaction was stored as `{"👍 1 234": ""}` -- a key no
+    caller can compare and a count nobody can read.
+    """
+    block = (
+        '<div class="tgme_widget_message_wrap">'
+        '<div class="tgme_widget_message" data-post="durov/523">'
+        '<div class="tgme_widget_message_reactions">'
+        '<span class="tgme_reaction">\U0001F44D 1\u202f234</span>'
+        '<span class="tgme_reaction">\U0001F525 7</span>'
+        "</div></div></div>"
+    )
+    page = tgparse.parse_preview(block, "durov")
+    assert page.messages[0].reactions == {
+        "\U0001F44D": "1\u202f234",
+        "\U0001F525": "7",
+    }
+
+
+def test_a_media_url_is_not_cut_at_the_first_bracket_inside_it():
+    r"""`url\(...)` stopped at the first `)` inside the value, quoted or not.
+
+    Half a URL downloads nothing while looking, in the record, exactly like a
+    file that was captured.
+    """
+    inner = (
+        '<div class="tgme_widget_message" data-post="durov/523">'
+        '<a class="tgme_widget_message_photo_wrap" style="background-image:'
+        "url('https://cdn4.telesco.pe/file/a(1)b.jpg')\"></a></div>"
+    )
+    page = tgparse.parse_preview(
+        '<div class="tgme_widget_message_wrap">%s</div>' % inner, "durov"
+    )
+    assert page.messages[0].media_urls == ["https://cdn4.telesco.pe/file/a(1)b.jpg"]

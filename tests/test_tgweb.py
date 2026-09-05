@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import http.client
 import io
 import json
@@ -17,6 +18,7 @@ import math
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -30,6 +32,7 @@ from pathlib import Path
 import pytest
 
 import tgweb
+from fakes import FastPacer, NullPacer
 
 # One live page, saved on 2026-08-24, that settles what a zero-hit `?q=` search
 # looks like. The probes directory is frozen, so it lives with the repair.
@@ -105,7 +108,7 @@ def raw_server(payload: bytes):
 
 def web(tmp_path, **kwargs):
     """A TelegramWeb that never sleeps: no pacing, no retry backoff."""
-    kwargs.setdefault("pacer", tgweb.NullPacer())
+    kwargs.setdefault("pacer", NullPacer())
     kwargs.setdefault("retry_backoff", 0.0)
     return tgweb.TelegramWeb(tmp_path, **kwargs)
 
@@ -137,11 +140,11 @@ def test_landing_nonexistent(probe):
     assert tgweb.online_count(body) is None
 
 
-def test_landing_group_hanoi_chats(probe):
-    # A03 is labelled "s-hanoi_chats" but its content is the landing card
+def test_landing_group_birding_chats(probe):
+    # A03 is labelled "s-birding_chats" but its content is the landing card
     # reached after the /s/ redirect -- the same page A18 is, for a different
     # group.
-    body = probe("A03-s-hanoi_chats.html")
+    body = probe("A03-s-birding_chats.html")
     assert tgweb.username_exists(body) is True
     assert tgweb.peer_type(body) == "group"
     assert tgweb.member_count(body) == 2_832
@@ -163,10 +166,10 @@ def test_preview_available_false_for_synthetic_302():
     # it was dropped from the corpus (it carried a live session cookie), and it
     # was never loaded here anyway: an empty body has nothing to read.
     resp = tgweb.Response(
-        url="https://t.me/s/hanoi_chats",
+        url="https://t.me/s/birding_chats",
         status=302,
         body="",
-        location="https://t.me/hanoi_chats",
+        location="https://t.me/birding_chats",
         bytes=0,
     )
     assert resp.redirected is True
@@ -195,12 +198,12 @@ def test_search_found_nothing_false_on_a_real_results_page(probe):
 # post_missing
 # --------------------------------------------------------------------------
 def test_post_missing_true(probe):
-    body = probe("C26-embed-hanoi-29320.html")
+    body = probe("C26-embed-birding-29320.html")
     assert tgweb.post_missing(body) is True
 
 
 def test_post_missing_false(probe):
-    body = probe("C26-embed-hanoi-29327.html")
+    body = probe("C26-embed-birding-29327.html")
     assert tgweb.post_missing(body) is False
 
 
@@ -260,7 +263,7 @@ def test_response_record_never_contains_the_body(probe):
 # Pacer -- cross-process state file
 # --------------------------------------------------------------------------
 def test_pacer_writes_state_file(tmp_path):
-    pacer = tgweb.FastPacer(tmp_path, min_gap=0.01, max_gap=0.01, batch_size=0, batch_rest=0.0)
+    pacer = FastPacer(tmp_path, min_gap=0.01, max_gap=0.01, batch_size=0, batch_rest=0.0)
     assert not pacer.path.exists()
     slept = pacer.wait()
     assert slept <= 0.02
@@ -276,9 +279,9 @@ def test_pacer_second_instance_sees_the_first_ones_reservation(tmp_path):
     # this test asserted `slept <= 0.02`, an UPPER bound, which a pacer that
     # never sleeps at all also satisfies -- a mutation run made exactly that
     # change and the whole suite stayed green.
-    first = tgweb.FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
+    first = FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
     first.wait()
-    second = tgweb.FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
+    second = FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
     assert second.path == first.path
 
     started = time.time()
@@ -306,7 +309,12 @@ PACER_CHILD = textwrap.dedent(
     state_dir, out, tag, gap = sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5])
     reserved = []
 
-    class Recording(tgweb.FastPacer):
+    class Recording(tgweb.Pacer):
+        # The gap floor lifted, the way `FastPacer` does it in the parent -- the
+        # child gets only the scripts directory on its path, so it says so here
+        # rather than importing the suite's fakes.
+        enforce_gap_floor = False
+
         # The real _reserve, with the instant it claimed written down. What this
         # class promises is the schedule it hands out; when the OS gets round to
         # waking the process afterwards is a property of the machine. `wait()`
@@ -413,7 +421,7 @@ def test_pacer_does_not_silently_stop_pacing_on_a_corrupt_state_file(tmp_path):
     # `_read` used to swallow OSError/ValueError and answer `{"last": 0.0}`, so
     # a truncated state file disabled pacing entirely and said nothing.
     for junk in ('{"last": 176', "", "not json at all", "[1,2,3]", '{"last": "soon"}'):
-        pacer = tgweb.FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
+        pacer = FastPacer(tmp_path, min_gap=0.2, max_gap=0.2, batch_size=0, batch_rest=0.0)
         pacer.path.write_text(junk, encoding="utf-8")
         slept = pacer.wait()
         assert slept >= 0.15, (junk, slept)
@@ -436,14 +444,14 @@ def test_a_pacer_that_cannot_take_the_lock_paces_a_full_gap_and_says_so(tmp_path
     # test proves nothing. `blocked`'s sleep_cap is 5 s, comfortably past the
     # 2 s standing reservation, so the "no queue can explain this" branch is
     # not what is being measured here. Nothing sleeps: `_reserve` only claims.
-    ahead = tgweb.FastPacer(tmp_path, min_gap=2.0, max_gap=2.0, batch_size=0, batch_rest=0.0)
+    ahead = FastPacer(tmp_path, min_gap=2.0, max_gap=2.0, batch_size=0, batch_rest=0.0)
     ahead._reserve()
     standing, _gap = ahead._reserve()
     assert standing > time.time() + 1.5, "the queue is not standing in the future"
 
-    blocked = tgweb.FastPacer(tmp_path, min_gap=0.5, max_gap=0.5, batch_size=0, batch_rest=0.0)
+    blocked = FastPacer(tmp_path, min_gap=0.5, max_gap=0.5, batch_size=0, batch_rest=0.0)
     assert blocked.sleep_cap > 2.0
-    monkeypatch.setattr(tgweb.FastPacer, "_acquire", lambda self: False)
+    monkeypatch.setattr(FastPacer, "_acquire", lambda self: False)
 
     due, gap = blocked._reserve()
     assert blocked.serialised_across_processes is False
@@ -456,7 +464,7 @@ def test_a_pacer_that_cannot_take_the_lock_paces_a_full_gap_and_says_so(tmp_path
 def test_pacer_does_not_obey_a_timestamp_from_the_future(tmp_path):
     # A `last` one day ahead -- a clock change, or a state file copied between
     # machines -- used to make wait() sleep for 86 402 s (24.0 h), uncapped.
-    pacer = tgweb.FastPacer(tmp_path, min_gap=0.05, max_gap=0.05, batch_size=0, batch_rest=0.0)
+    pacer = FastPacer(tmp_path, min_gap=0.05, max_gap=0.05, batch_size=0, batch_rest=0.0)
     pacer.path.write_text(
         json.dumps({"last": time.time() + 86_400, "count": 1}), encoding="utf-8"
     )
@@ -476,7 +484,7 @@ def test_pacer_reserves_rather_than_reading(tmp_path):
     # caller computes its slot from that instant, not from the last firing.
     # Reading alone is what shipped, and two processes then read the same
     # `last`, slept to the same instant and fired together.
-    pacer = tgweb.FastPacer(tmp_path, min_gap=0.5, max_gap=0.5, batch_size=0, batch_rest=0.0)
+    pacer = FastPacer(tmp_path, min_gap=0.5, max_gap=0.5, batch_size=0, batch_rest=0.0)
     pacer.wait()                                    # nothing to pace against yet
     before = time.time()
     due, _gap = pacer._reserve()
@@ -488,14 +496,14 @@ def test_pacer_reserves_rather_than_reading(tmp_path):
 
 
 def test_pacer_releases_its_lock(tmp_path):
-    pacer = tgweb.FastPacer(tmp_path, min_gap=0.0, max_gap=0.0, batch_size=0, batch_rest=0.0)
+    pacer = FastPacer(tmp_path, min_gap=0.0, max_gap=0.0, batch_size=0, batch_rest=0.0)
     pacer.wait()
     assert not pacer.lock_path.exists()
     assert pacer.serialised_across_processes is True
 
 
 def test_null_pacer_never_sleeps():
-    pacer = tgweb.NullPacer()
+    pacer = NullPacer()
     assert pacer.wait() == 0.0
     # It says what it is rather than claiming a guarantee it does not give.
     assert pacer.serialised_across_processes is False
@@ -573,12 +581,12 @@ def test_a_302_is_still_data_and_not_a_failure(tmp_path):
     # for a name that does not exist, and the 302 is the measurement.
     def respond(handler):
         handler.send_response(302)
-        handler.send_header("Location", "http://127.0.0.1/hanoi_chats")
+        handler.send_header("Location", "http://127.0.0.1/birding_chats")
         handler.send_header("Content-Length", "0")
         handler.end_headers()
 
     with http_server(respond) as base:
-        resp = web(tmp_path).fetch(f"{base}/s/hanoi_chats", follow=False)
+        resp = web(tmp_path).fetch(f"{base}/s/birding_chats", follow=False)
     assert resp.status == 302
     assert resp.redirected is True
     assert tgweb.preview_available(resp) is False
@@ -807,7 +815,7 @@ def test_the_user_verdict_still_fires_for_a_real_personal_account(probe):
 def test_every_real_landing_card_still_classifies(probe):
     assert tgweb.peer_type(probe("C01-landing-durov.html")) == "channel"
     assert tgweb.peer_type(probe("A18-landing-tdlibchat.html")) == "group"
-    assert tgweb.peer_type(probe("A03-s-hanoi_chats.html")) == "group"
+    assert tgweb.peer_type(probe("A03-s-birding_chats.html")) == "group"
     assert tgweb.peer_type(probe("C02-landing-nonexistent.html")) is None
 
 
@@ -833,7 +841,7 @@ def test_a_single_post_page_cannot_say_whether_the_name_is_a_channel(probe):
 
 def test_every_real_landing_card_still_answers_exists(probe):
     for name in ("C01-landing-durov.html", "A18-landing-tdlibchat.html",
-                 "A03-s-hanoi_chats.html", "A17-s-tdlibchat.html"):
+                 "A03-s-birding_chats.html", "A17-s-tdlibchat.html"):
         assert tgweb.username_exists(probe(name)) is True, name
     assert tgweb.username_exists(probe("C02-landing-nonexistent.html")) is False
 
@@ -850,9 +858,9 @@ def test_no_embed_page_in_the_corpus_carries_a_message_wrap(probe):
     uses it the clause never did anything.
     """
     for name in ("C05-embed-durov-523.html", "C07-embed-tdlibchat-1.html",
-                 "C10-embed-tdlibchat-10000.html", "C16-embed-hanoi-1000.html",
-                 "C26-embed-hanoi-29327.html", "C08-embed-tdlibchat-50000.html",
-                 "C26-embed-hanoi-29320.html"):
+                 "C10-embed-tdlibchat-10000.html", "C16-embed-birding-1000.html",
+                 "C26-embed-birding-29327.html", "C08-embed-tdlibchat-50000.html",
+                 "C26-embed-birding-29320.html"):
         assert tgweb.MSG_WRAP not in probe(name), name
 
 
@@ -913,8 +921,8 @@ def test_has_class_matches_a_class_token_not_a_substring():
 
 
 def test_embed_unreadable_is_the_third_answer(probe):
-    live = probe("C26-embed-hanoi-29327.html")
-    gone = probe("C26-embed-hanoi-29320.html")
+    live = probe("C26-embed-birding-29327.html")
+    gone = probe("C26-embed-birding-29320.html")
     wall = "<html><body>Join this group to view</body></html>"
     assert (tgweb.post_missing(live), tgweb.embed_unreadable(live)) == (False, False)
     assert (tgweb.post_missing(gone), tgweb.embed_unreadable(gone)) == (True, False)
@@ -964,8 +972,8 @@ def test_a_non_numeric_gap_falls_back_to_the_shipped_default(tmp_path):
 
 def test_only_the_test_only_subclasses_lift_the_floor(tmp_path):
     assert tgweb.Pacer.enforce_gap_floor is True
-    assert tgweb.FastPacer.enforce_gap_floor is False
-    fast = tgweb.FastPacer(tmp_path, min_gap=0.01, max_gap=0.01)
+    assert FastPacer.enforce_gap_floor is False
+    fast = FastPacer(tmp_path, min_gap=0.01, max_gap=0.01)
     assert (fast.min_gap, fast.max_gap) == (0.01, 0.01)
     assert fast.gap_floor_note is None
 
@@ -982,10 +990,18 @@ def _script_opener(monkeypatch, script, calls, effective=None):
             self.url = url
             self.status = status
             self._body = body
+            self._pos = 0
             self.headers = dict(headers)
 
-        def read(self):
-            return self._body
+        def read(self, amt=None):
+            # `read(n)` returns at most n bytes, as http.client's does: fetch()
+            # reads the body in bounded chunks rather than in one call.
+            if amt is None or amt < 0:
+                chunk, self._pos = self._body[self._pos:], len(self._body)
+                return chunk
+            chunk = self._body[self._pos:self._pos + amt]
+            self._pos += len(chunk)
+            return chunk
 
         def __enter__(self):
             return self
@@ -1440,3 +1456,317 @@ def test_a_free_name_and_a_real_account_are_unchanged(probe):
     )
     assert taken != body
     assert tgweb.peer_type(taken) == "user"
+
+
+# --------------------------------------------------------------------------
+# A body has a ceiling, in bytes and in seconds
+# --------------------------------------------------------------------------
+def test_a_body_far_larger_than_a_page_is_not_read_whole(tmp_path, monkeypatch):
+    """`fh.read()` buffered whatever the server chose to send.
+
+    Measured: 203 861 bytes of gzip expanded to 200 MB, were decompressed,
+    decoded into a 200 MB string and -- with `save_as` -- written to disk, out
+    of one request that looked ordinary in the fetch log. The ceiling is
+    lowered here rather than an 8 MiB body being served, because the defect is
+    the missing bound and not the number.
+    """
+    monkeypatch.setattr(tgweb, "MAX_BODY_BYTES", 4096)
+    payload = b"<html><body>" + b"x" * 20_000 + b"</body></html>"
+    with http_server(lambda h: _plain(h, 200, payload)) as base:
+        client = web(tmp_path)
+        with pytest.raises(tgweb.TelegramWebError) as excinfo:
+            client.fetch(f"{base}/s/durov")
+    assert "4096" in str(excinfo.value)
+
+
+def test_a_small_gzip_body_that_expands_past_the_ceiling_is_refused(tmp_path, monkeypatch):
+    """The wire size says nothing about the size of the page.
+
+    A 200 KB gzip body was 200 MB after decompression, and the decompression is
+    where the memory went -- so the ceiling is enforced on the output too, not
+    only on what arrived.
+    """
+    monkeypatch.setattr(tgweb, "MAX_BODY_BYTES", 4096)
+    packed = gzip.compress(b"y" * 200_000)
+    assert len(packed) < 4096                      # small on the wire
+
+    def respond(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Encoding", "gzip")
+        handler.send_header("Content-Length", str(len(packed)))
+        handler.end_headers()
+        handler.wfile.write(packed)
+
+    with http_server(respond) as base:
+        with pytest.raises(tgweb.TelegramWebError):
+            web(tmp_path).fetch(f"{base}/s/durov")
+
+
+def test_a_body_that_only_trickles_hits_a_deadline():
+    """`timeout` bounds ONE socket read, so a slow trickle never trips it.
+
+    A server that sends a chunk just often enough keeps a request alive for as
+    long as it likes; the whole-body deadline is the bound that ends it.
+    """
+
+    class _Trickle:
+        length = 1                                  # more was promised than sent
+
+        def read(self, amt=None):
+            return b"x" * 10
+
+    with pytest.raises(tgweb.TruncatedBody) as excinfo:
+        tgweb._read_body(_Trickle(), time.time() - 1)
+    assert "socket read" in str(excinfo.value)
+
+
+def test_a_complete_body_is_returned_whole(tmp_path):
+    # The control: chunked reading must not change what an ordinary page is.
+    payload = b"<html><body>" + b"z" * 200_000 + b"</body></html>"
+    with http_server(lambda h: _plain(h, 200, payload)) as base:
+        resp = web(tmp_path).fetch(f"{base}/s/durov")
+    assert resp.bytes == len(payload)
+    assert resp.body.encode("utf-8") == payload
+
+
+# --------------------------------------------------------------------------
+# A third-party surface cannot close Telegram
+# --------------------------------------------------------------------------
+LYZEM_QUERY = "https://lyzem.com/search?q=captcha&f=messages"
+BIG_PAGE = "<html><body>" + "x" * 2000 + "</body></html>"
+
+
+def test_a_search_result_for_the_word_captcha_is_not_an_interstitial():
+    """`discover --lyzem-query captcha` could not complete, at all.
+
+    Both structural guards in `challenge_page` are t.me's own markup, so on a
+    third-party surface neither can ever fire and the test fell back to "does
+    this body contain one of fourteen strings" -- over a page of search results,
+    i.e. over text the query itself chose. Off t.me only the markup markers may
+    answer.
+    """
+    body = ("<html><body><h1>captcha</h1><p>Just a moment: how to verify you "
+            "are human</p>" + "x" * 2000 + "</body></html>")
+    assert tgweb.challenge_page(body, url=LYZEM_QUERY) is False
+    resp = tgweb.Response(url=LYZEM_QUERY, status=200, body=body,
+                          bytes=len(body.encode("utf-8")))
+    assert tgweb.stop_signal(resp) is None
+
+    # ...and the same prose on t.me still stops the run, as it always did
+    assert tgweb.challenge_page(body) is True
+    assert tgweb.challenge_page(body, url="https://t.me/s/durov") is True
+
+
+def test_a_real_interstitial_on_a_third_party_host_is_still_one():
+    # The markup markers are a script path and Cloudflare's own attribute
+    # names: a page quotes those far less readily than it quotes the prose.
+    assert tgweb.challenge_page(CHALLENGE_2026, url=LYZEM_QUERY) is True
+    assert tgweb.challenge_page(CHALLENGE_LEGACY, url=LYZEM_QUERY) is True
+
+
+def test_a_stop_on_another_host_does_not_close_telegram(tmp_path, site):
+    """`aborted_reason` was one field for every surface this client touches.
+
+    `discover` fetches lyzem through this same `fetch`, so a 503 from a
+    third-party search engine closed Telegram down too -- irreversibly, and
+    under a sentence that named Telegram as the refuser. Measured: after a stop
+    on lyzem, the next t.me request raised "HTTP 503 from Telegram. Run
+    stopped" without going near the network.
+    """
+    site.add(LYZEM_QUERY, "<html>nope</html>" + "x" * 2000, status=503)
+    site.add("https://t.me/s/durov", BIG_PAGE)
+    client = web(tmp_path)
+
+    with pytest.raises(tgweb.RunAborted) as excinfo:
+        client.fetch(LYZEM_QUERY)
+    assert "lyzem.com" in str(excinfo.value)
+    assert "from Telegram" not in str(excinfo.value)
+
+    assert client.fetch("https://t.me/s/durov").status == 200   # used to raise
+
+    # and the surface that refused stays closed: nothing keeps asking it
+    with pytest.raises(tgweb.RunAborted):
+        client.fetch(LYZEM_QUERY)
+
+
+def test_telegram_saying_stop_still_closes_telegram(tmp_path, site):
+    # The other direction, and the one that must not be weakened: a 429 from
+    # t.me ends the run for t.me, from the request after it onwards.
+    site.add("https://t.me/s/durov", "rate limited" + "x" * 2000, status=429)
+    site.add("https://t.me/durov/1?embed=1", BIG_PAGE)
+    client = web(tmp_path)
+    with pytest.raises(tgweb.RunAborted):
+        client.fetch("https://t.me/s/durov")
+    assert client.aborted_reason is not None
+    with pytest.raises(tgweb.RunAborted):
+        client.fetch("https://t.me/durov/1?embed=1")
+    assert len(site.requested) == 1, "the second request must not reach the wire"
+
+
+# --------------------------------------------------------------------------
+# retries: only the failures a second attempt could fix
+# --------------------------------------------------------------------------
+def test_a_name_that_does_not_resolve_is_not_retried(tmp_path, monkeypatch):
+    """Three network acts and 180 seconds of sleeping to re-learn a fact.
+
+    DNS refusing a name is settled: the second and third attempts ask the same
+    resolver the same question. The retry path is for the flaky link.
+    """
+    calls, logged = [], []
+    failure = urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))
+    _script_opener(monkeypatch, [failure] * 5, calls)
+    client = web(tmp_path, on_fetch=logged.append)
+    with pytest.raises(tgweb.TelegramWebError):
+        client.fetch("https://t.me/s/durov")
+
+    assert len(calls) == 1
+    assert client.request_count == 1 == len(logged)   # still counted and logged
+
+
+def test_a_certificate_that_does_not_verify_is_not_retried(tmp_path, monkeypatch):
+    calls = []
+    failure = urllib.error.URLError(
+        ssl.SSLCertVerificationError(1, "certificate verify failed")
+    )
+    _script_opener(monkeypatch, [failure] * 5, calls)
+    with pytest.raises(tgweb.TelegramWebError):
+        web(tmp_path).fetch("https://t.me/s/durov")
+    assert len(calls) == 1
+
+
+def test_a_body_over_the_ceiling_is_not_fetched_three_times(tmp_path, monkeypatch):
+    """A page that is too big will be exactly as big on the second attempt.
+
+    The ceiling and the flaky link both arrive as `TruncatedBody`, so a body
+    refused for its size used to be retried like a dropped connection: three
+    attempts and two backoff sleeps to download the same oversized page twice
+    more. Only the half-arrived body is worth another request.
+    """
+    monkeypatch.setattr(tgweb, "MAX_BODY_BYTES", 4096)
+    calls, logged = [], []
+    payload = b"<html><body>" + b"x" * 20_000 + b"</body></html>"
+    with http_server(lambda h: _plain(h, 200, payload)) as base:
+        client = web(tmp_path, on_fetch=logged.append)
+        with pytest.raises(tgweb.TelegramWebError):
+            client.fetch(f"{base}/s/durov")
+
+    assert client.request_count == 1, "one attempt, not MAX_RETRIES of them"
+    assert len(logged) == 1
+    assert calls == []
+
+
+def test_a_timeout_is_still_retried(tmp_path, monkeypatch):
+    # The control: the flaky link is what the retries are for, and they stay.
+    calls = []
+    _script_opener(monkeypatch, [TimeoutError("timed out")] * 5, calls)
+    with pytest.raises(tgweb.TelegramWebError):
+        web(tmp_path).fetch("https://t.me/s/durov")
+    assert len(calls) == tgweb.MAX_RETRIES
+
+
+# --------------------------------------------------------------------------
+# the last two classifiers that were still reading characters, not structure
+# --------------------------------------------------------------------------
+def test_a_page_extra_with_a_second_class_is_still_a_page_extra(probe):
+    """`class="tgme_page_extra"` demanded that this be the element's ONLY class.
+
+    One added class -- a styling variant, an A/B test -- and a channel of
+    millions came back `type: "user", members: null, exists: true`, which is
+    the one verdict `peer_type` documents as unfit for the registry.
+    """
+    body = probe("C01-landing-durov.html")
+    assert tgweb.peer_type(body) == "channel"
+    widened = body.replace('class="tgme_page_extra"',
+                           'class="tgme_page_extra tgme_page_extra_wide"')
+    assert widened != body
+    assert tgweb.peer_type(widened) == "channel"
+    assert tgweb.member_count(widened) == tgweb.member_count(body)
+    # and a class that merely starts the same way is still not this one: the
+    # word boundary is what keeps `tgme_page_extra_wide` from answering here
+    renamed = body.replace('class="tgme_page_extra"', 'class="tgme_page_extra_wide"')
+    assert tgweb._page_extra(renamed) is None
+    assert tgweb.member_count(renamed) is None
+
+
+def test_preview_available_reads_a_class_and_not_the_page_text(probe):
+    """The last substring classifier in the file, and it decides whether a walk stops.
+
+    A post quoting the wrap class made an unreadable page look served; the same
+    test in reverse is a served page looking unreadable, which is the `found: 0`
+    in the shape of a real ending that this skill exists never to publish.
+    """
+    quoting = ('<html><body><div class="tgme_page_wrap"><p>the class is called '
+               "tgme_widget_message_wrap</p>" + "x" * 2000 + "</div></body></html>")
+    resp = tgweb.Response(url="https://t.me/s/durov", status=200, body=quoting,
+                          bytes=len(quoting.encode("utf-8")))
+    assert tgweb.preview_available(resp) is False
+
+    real = probe("A01-s-durov.html")
+    ok = tgweb.Response(url="https://t.me/s/durov", status=200, body=real,
+                        bytes=len(real.encode("utf-8")))
+    assert tgweb.preview_available(ok) is True
+
+
+# --------------------------------------------------------------------------
+# saving a page: two ways the filename could fail on this machine
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("name", ["con.html", "NUL.html", "aux", "com1.html"])
+def test_a_windows_device_name_never_becomes_a_filename(name):
+    """`con.html` is not a file on Windows -- it is the console.
+
+    Opening it for writing succeeds and writes nowhere, so the saved original
+    for `t.me/con` vanished with no error anywhere. The skill is developed on
+    Windows and `save_as` is built out of a username.
+    """
+    safe = tgweb._safe_name(name)
+    assert safe.partition(".")[0].lower() not in tgweb._WINDOWS_DEVICE_NAMES
+    assert name in safe          # still recognisable, just not a device any more
+
+
+def test_an_ordinary_name_is_left_exactly_as_it_was():
+    assert tgweb._safe_name("durov-q-bitcoin-0.html") == "durov-q-bitcoin-0.html"
+
+
+def test_the_collision_digest_survives_a_fips_build(tmp_path, monkeypatch):
+    """`hashlib.sha1(payload)` raises outright where FIPS is enforced.
+
+    It is a filename here, not a signature, and a naming collision must not
+    become a crash. The FIPS build is simulated by refusing the call the way
+    such a build refuses it.
+    """
+    real_sha1 = hashlib.sha1
+
+    def fips_sha1(data=b"", **kwargs):
+        if not kwargs.get("usedforsecurity", True):
+            return real_sha1(data)
+        raise ValueError("[digital envelope routines] unsupported")
+
+    monkeypatch.setattr(tgweb.hashlib, "sha1", fips_sha1)
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    for n in range(1, 503):                     # past the runaway-loop guard
+        name = "page.html" if n == 1 else f"page-{n}.html"
+        (sources / name).write_bytes(b"a different page %d" % n)
+
+    landed = tgweb._write_original(sources, "page.html", b"the new page")
+    assert landed.read_bytes() == b"the new page"
+    assert landed.name.startswith("page-") and landed.name.endswith(".html")
+
+
+# --------------------------------------------------------------------------
+# the pacer's third number
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "slow"])
+def test_a_non_finite_batch_rest_is_refused_like_the_gaps(tmp_path, bad):
+    """The one number reaching this class from the config that nothing checked.
+
+    `json.loads` accepts the bare literal `NaN`, and NaN makes every comparison
+    false: `sleep_cap` became NaN, which disarms the "a reservation from the
+    future is a bad number" repair, and `max(gap, nan)` is NaN on every batch
+    boundary.
+    """
+    pacer = FastPacer(tmp_path, min_gap=0.01, max_gap=0.01, batch_rest=bad)
+    assert pacer.batch_rest == tgweb.DEFAULT_BATCH_REST
+    assert math.isfinite(pacer.sleep_cap)
+    assert pacer.gap_floor_note is not None and "batch rest" in pacer.gap_floor_note

@@ -174,13 +174,13 @@ def test_fetchlog_records_the_act_and_never_the_page(tmp_path):
 def test_posts_keep_emoji_and_the_query_that_found_them(tmp_path):
     run = _run(tmp_path)
     run.write_posts([
-        tgparse.Message(username="hanoi_chats", id=29327,
-                        url="https://t.me/hanoi_chats/29327",
+        tgparse.Message(username="birding_chats", id=29327,
+                        url="https://t.me/birding_chats/29327",
                         date="2026-08-22T17:58:18+00:00", text="Привет 🏠",
                         found_by="жетонов")
     ])
     row = json.loads(run.posts_path.read_text(encoding="utf-8").strip())
-    assert row["url"] == "https://t.me/hanoi_chats/29327"
+    assert row["url"] == "https://t.me/birding_chats/29327"
     assert row["date"] == "2026-08-22T17:58:18+00:00"
     assert "🏠" in row["text"]
     assert row["found_by"] == "жетонов"
@@ -307,16 +307,16 @@ def test_report_skeleton_states_the_account_was_not_used(tmp_path):
     run = _run(tmp_path)
     run.count("requests", 22)
     run.count("posts", 95)
-    posts = [{"username": "Hanoirentapartment", "url": "https://t.me/Hanoirentapartment/1"}]
-    sources = [{"username": "Hanoirentapartment", "type": "channel",
+    posts = [{"username": "Birdingfieldguide", "url": "https://t.me/Birdingfieldguide/1"}]
+    sources = [{"username": "Birdingfieldguide", "type": "channel",
                 "members": 329, "found_via": "web"}]
     text = report_skeleton(run, discovery=None,
                            query_log=querycraft.QueryLog(),
                            sources_used=sources, posts=posts)
 
     assert "The account was not used" in text
-    assert "Hanoirentapartment" in text
-    assert "https://t.me/Hanoirentapartment" in text
+    assert "Birdingfieldguide" in text
+    assert "https://t.me/Birdingfieldguide" in text
     # An empty vocabulary is reported as a fact of the run, never quietly omitted
     # -- but only when the log is really there and really empty.
     assert "Not one word could be mined" in text
@@ -387,9 +387,9 @@ def test_report_does_not_open_a_second_door_for_the_credential(cli, tmp_path):
 
 def test_two_runs_of_one_question_on_one_day_do_not_share_a_folder(cli, tmp_path):
     """14 post lines, 7 distinct URLs, one brief describing only the second run."""
-    first = cli("--root", tmp_path, "newrun", "--question", "аренда в Ханое",
+    first = cli("--root", tmp_path, "newrun", "--question", "аренда студии",
                 "--topic", "relocation")
-    second = cli("--root", tmp_path, "newrun", "--question", "аренда в Ханое",
+    second = cli("--root", tmp_path, "newrun", "--question", "аренда студии",
                  "--topic", "relocation", "--depth", "deep")
     assert first.json["run"] != second.json["run"]
     assert Path(first.json["run"]).exists() and Path(second.json["run"]).exists()
@@ -623,12 +623,29 @@ def test_a_stop_signal_on_a_group_read_is_json_and_exit_three(cli, site, tmp_pat
     assert stopped.json["ok"] is False and stopped.json["stopped"]
 
 
-def test_discover_turns_a_stop_signal_into_json(cli, site, tmp_path):
+def test_a_third_party_stop_closes_that_index_and_not_the_command(cli, site,
+                                                                  tmp_path):
+    """lyzem is a convenience, and t.me is the surface everything rests on.
+
+    A stop used to latch on the client rather than on the host that sent it, so
+    one 429 from lyzem ended the command, and every later read of t.me on the
+    same client failed with a message about Telegram. Measured before the fix:
+    `discover --lyzem-query "captcha"` could not complete at all, because the
+    word itself matched the challenge-page markers on lyzem's own results page.
+
+    Now the stop closes lyzem: the remaining lyzem modes are skipped, the cut is
+    named in `silent_cuts`, and the command finishes. A stop from t.me still
+    ends the run -- that one is pinned by the tests either side of this.
+    """
     site.add(tg.discover_module.lyzem_url("flood test", kind="groups"),
              "rate limited", status=429)
     result = cli("discover", "--lyzem-query", "flood test")
-    assert result.exit_code == tg.EXIT_STOPPED
-    assert result.json["ok"] is False and result.json["stopped"]
+
+    assert result.exit_code == tg.EXIT_OK, result.stdout
+    assert result.json["ok"] is True
+    assert any("lyzem stopped answering" in note
+               for note in result.json["silent_cuts"]), result.json
+    assert len(site.requested) == 1, "the other lyzem modes are on the same host"
 
 
 def test_the_declared_request_ceiling_is_enforced(cli, site, probe, tmp_path):
@@ -772,7 +789,7 @@ def test_group_cannot_be_asked_to_guess_which_ids_exist(cli, site, probe):
     """There is no way to say "read this group" without saying which ids.
 
     There used to be: a head estimator, a catch-up creep and a blind scan, and
-    they are gone because they could not do the job. Measured on `hanoi_chats`,
+    they are gone because they could not do the job. Measured on `birding_chats`,
     200 requests bought 2 messages and 0 hits on the word the run was about --
     about one id in a hundred answers, so ten messages containing one word would
     have cost ~199 000 GETs against 29 327 ids that exist. `--id` is required,
@@ -1627,3 +1644,142 @@ def test_run_open_anchors_a_relative_root_before_it_creates_anything(
     plain = Run.open(Brief(question="абсолютный корень", topic="t"),
                      root=tmp_path)
     assert plain.root.is_relative_to(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# Two processes, one run, one arithmetic
+# --------------------------------------------------------------------------
+def _network_act(run) -> None:
+    """Exactly what `log_fetch` does: the evidence first, the counter after."""
+    config_module.guarded_append(
+        run.fetchlog_path,
+        [json.dumps({"kind": "fetch", "url": "https://t.me/durov/1"})],
+        label="fetch log")
+    run.count("requests")
+
+
+def test_a_parallel_fan_out_does_not_count_one_network_act_twice(tmp_path):
+    """`attach` raised a stale `run.json` to the folder's own files and left the
+    BASELINE where it was, so `finish()` wrote the catch-up as this process's
+    own delta.
+
+    That is right for a command killed outright and wrong for the fan-out
+    `SKILL.md` documents -- a `research` branch reads three channels in three
+    processes against one run -- because the acts caught up on belong to a
+    sibling that is still running and writes them itself a moment later.
+
+    Measured before this: 5 network acts in one process and 1 in another,
+        fetchlog.jsonl : 6 lines
+        run.json       : 11
+    plus 83 %, and the request ceiling firing at 55 % of the budget the brief
+    states. `run.json` is documented as the spend of every process of one run.
+    """
+    root = tmp_path / "run"
+    Run(root, Brief(question="вопрос")).finish()
+
+    first = Run.attach(root)                 # both attach at requests: 0
+    for _ in range(5):
+        _network_act(first)                  # ... and the first one spends
+    second = Run.attach(root)                # while the second attaches
+    _network_act(second)
+    second.finish()
+    first.finish()
+
+    acts = len([line for line in
+                (root / "fetchlog.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()])
+    counted = json.loads((root / "run.json").read_text(encoding="utf-8"))
+    assert acts == 6
+    assert counted["counters"]["requests"] == acts, counted["counters"]
+
+    # A third process arms its ceiling from that number and not from a fiction.
+    assert Run.attach(root).counters["requests"] == 6
+
+    # And nothing in the folder claims a command was killed. Two things leave a
+    # run.json behind its own folder and this cannot tell them apart, so the
+    # note that goes into `stop_reasons` for ever -- and into the report's
+    # "what limited this run" section -- may not assert either one.
+    for reason in counted["stop_reasons"]:
+        if "behind this folder" in reason:
+            assert "fan-out" in reason, reason
+
+
+# --------------------------------------------------------------------------
+# A brief that cannot be read is not the end of the run folder
+# --------------------------------------------------------------------------
+def test_an_unreadable_brief_json_does_not_brick_the_run_folder(tmp_path):
+    """`attach` called `Brief.from_file` bare, so a truncated `brief.json` took
+    `note`, `report`, `accept`, `queries` and every `--run <folder>` down with a
+    `JSONDecodeError` naming neither the file nor a way out -- including the
+    documented repair, which goes through `attach` itself.
+
+    `newrun` wrote that file with a plain `write_text`, truncate first, so an
+    interrupt during `newrun` produced exactly this state. The fallback was
+    already here and unreachable: `finish()` puts a copy of the brief into
+    `run.json` on the very first command.
+    """
+    run = Run(tmp_path / "run", Brief(question="настоящий вопрос", topic="x"))
+    run.finish()
+    (run.root / "brief.json").write_text('{"question": "насто', encoding="utf-8")
+
+    attached = Run.attach(run.root)
+    assert attached.brief.question == "настоящий вопрос"
+    said = " ".join(attached.stop_reasons)
+    assert "brief.json" in said and "run.json" in said, said
+
+    # The run keeps working: counters, notes and a report all still land.
+    attached.count("requests", 2)
+    assert attached.finish()["counters"]["requests"] == 2
+
+
+def test_a_brief_saved_with_a_bom_is_read_rather_than_refused(tmp_path):
+    """"UTF-8" in Notepad, and in PowerShell 5.1's `Out-File`, means UTF-8 with
+    a BOM. `json.loads` reads those three bytes as garbage before the opening
+    brace, and `--brief <file.json>` is the entry point SKILL.md names for a
+    calling agent -- which is to say, for a file this skill did not write."""
+    path = tmp_path / "brief.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+        {"question": "вопрос", "depth": "deep"}, ensure_ascii=False).encode("utf-8"))
+    brief = Brief.from_file(path)
+    assert brief.question == "вопрос"
+    assert brief.depth == "deep"
+
+
+def test_the_run_folders_own_artefacts_are_written_atomically(tmp_path, monkeypatch):
+    """`brief.json` and `acceptance.json` were the last bare `write_text` calls
+    in the run folder, beside `run.json` and `queries.json` which get the guard
+    and the atomic replace. `write_text` truncates before it writes: an
+    interrupt leaves half a file, and for these two that half is a bricked
+    folder and a gate verdict nothing can read."""
+    written: list[str] = []
+    real = config_module.atomic_write_text
+
+    def watched(path, text, **kwargs):
+        written.append(Path(path).name)
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(config_module, "atomic_write_text", watched)
+    run = Run.open(Brief(question="вопрос", topic="t"), root=tmp_path)
+    assert "brief.json" in written, written
+
+    run.write_acceptance({"tool": "tg.py accept", "formal": "PASS",
+                          "checked_at": "2026-09-05T00:00:00"})
+    assert "acceptance.json" in written, written
+    verdict = json.loads((run.root / "acceptance.json").read_text(encoding="utf-8"))
+    assert verdict["formal"] == "PASS"
+
+
+def test_two_newruns_of_one_question_cannot_choose_the_same_folder(tmp_path):
+    """`_free_folder` looked at the name and let the caller create it, so two
+    `newrun` processes started together on the same question and the same day
+    both got the same directory: the second one's brief overwrote the first's
+    and both runs appended to one `posts.jsonl`. That is the exact confusion
+    the `-N` suffix exists to prevent, and the docstring of `Run.open` states
+    it as fixed. `mkdir` without `exist_ok` is the one test that cannot be
+    raced."""
+    wanted = tmp_path / "telegram-runs" / "2026-09-05-аренда"
+    first = run_module._free_folder(wanted)
+    second = run_module._free_folder(wanted)
+    assert first != second, "both processes were handed the same run folder"
+    assert first.is_dir() and second.is_dir()
+    assert second.name.endswith("-2")

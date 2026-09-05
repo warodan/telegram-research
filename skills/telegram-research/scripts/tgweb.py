@@ -32,11 +32,14 @@ from __future__ import annotations
 import gzip
 import hashlib
 import http.client
+import io
 import itertools
 import json
 import os
 import random
 import re
+import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -68,6 +71,23 @@ DEFAULT_BATCH_SIZE = 50        # requests before the long rest
 DEFAULT_BATCH_REST = 60.0      # seconds of rest after a batch
 DEFAULT_TIMEOUT = 30.0         # seconds per request
 MAX_RETRIES = 3                # transport errors only; a refusal is never retried
+
+# The two ceilings on ONE body, and why a timeout is neither of them.
+# `DEFAULT_TIMEOUT` is passed to `opener.open` and bounds a single socket
+# operation, so a server that keeps trickling bytes never trips it and a body
+# with no declared length never ends. Measured: 203 861 bytes of gzip expanded
+# to 200 MB, were decompressed whole, decoded to a 200 MB string and -- with
+# `save_as` -- written to disk, out of one request that looked ordinary in the
+# fetch log.
+#
+# 8 MiB against a corpus whose largest page is 146 974 bytes (C03, a `?q=`
+# search on @durov) is ~57x the biggest thing t.me has ever served this skill,
+# so nothing real can reach it; and a body that does reach it is not a page
+# this module can parse anyway. `MAX_BODY_SECONDS` is the same bound in the
+# other dimension: the whole body, not one socket read.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+MAX_BODY_SECONDS = 120.0
+READ_CHUNK_BYTES = 64 * 1024   # how much of the body is asked for at a time
 BACKOFF_CAP = 300.0            # seconds; matches the FloodWait ceiling used elsewhere
 RETRY_BACKOFF_BASE = 60.0      # seconds before the 2nd attempt; doubles after that
 
@@ -117,7 +137,6 @@ ERR_MESSAGE = "err_message"
 # The marker is right -- and Telegram wraps it in a `tgme_widget_message_wrap`,
 # which is why nothing may pair this marker with a "and no message wrap" test.
 NO_MESSAGES_FOUND = "tme_no_messages_found"
-PAGE_EXTRA = "tgme_page_extra"
 # A t.me profile card. Absent from a third-party page, an interstitial or a
 # wrong URL; `tgme_page_post` narrows a t.me page down to a single post, which
 # is a message page and not a peer card either.
@@ -136,12 +155,23 @@ PAGE_POST = "tgme_page_post"
 #    the legacy "checking your browser" wording is gone. A markup marker beats
 #    prose here, because prose is localised and the script path is not.
 # 2. **A marker alone may never abort a run** -- see `challenge_page`.
-CHALLENGE_MARKERS = (
+#
+# The list is split in two because the structural guards in `challenge_page`
+# (`tgme_page_wrap`, `data-post`) are t.me's markup and cannot appear on a
+# third-party surface at all -- so off t.me the test collapsed to "does this
+# body contain one of fourteen strings", and a search-results page for the word
+# `captcha` contains one. Markup markers are a script path and Cloudflare's own
+# attribute names, which a page quotes far less readily than it quotes prose;
+# they are the only ones allowed to speak for a host whose markup this module
+# cannot check. See `challenge_page`.
+CHALLENGE_MARKUP_MARKERS = (
     "cdn-cgi/challenge-platform",     # the script every CF interstitial loads
     "cf-browser-verification",
     "cf_chl_opt",
     "__cf_chl",
     "cf-error-details",
+)
+CHALLENGE_PROSE_MARKERS = (
     "just a moment",
     "checking your browser before accessing",
     "verify you are human",
@@ -152,6 +182,7 @@ CHALLENGE_MARKERS = (
     "ddos protection by cloudflare",
     "captcha",
 )
+CHALLENGE_MARKERS = CHALLENGE_MARKUP_MARKERS + CHALLENGE_PROSE_MARKERS
 
 # A body this small on a surface that should carry messages is not a page, it is
 # a shrug. The smallest real /s/ body in the probes was 62 461 bytes for a search
@@ -175,6 +206,17 @@ class RunAborted(RuntimeError):
 
 class TruncatedBody(RuntimeError):
     """A body arrived that will not decompress. Internal to `fetch`'s retry path."""
+
+
+class BodyTooLarge(TruncatedBody):
+    """The body outgrew `MAX_BODY_BYTES`, or took longer than `MAX_BODY_SECONDS`.
+
+    A subclass because the callers that catch `TruncatedBody` mean "the body did
+    not arrive whole", which is true here too. It is separate because the retry
+    path must tell the two apart: a half-arrived body is the flaky link retrying
+    exists for, while a page that is too big will be exactly as big next time --
+    three attempts at it are 24 MB on the wire to learn what the first one did.
+    """
 
 
 class FetchFailed(RuntimeError):
@@ -300,10 +342,11 @@ class Pacer:
       can see that a value was refused.
     """
 
-    # Lifted only by `FastPacer`, which the CLI never constructs. Deliberately a
-    # class attribute rather than a constructor argument: an argument is one
-    # `**cfg` away from being reachable from a config file, and the whole point
-    # of this floor is that a config file cannot lower it.
+    # Nothing in the skill ever lifts this; the only subclass that does lives
+    # in the test suite, which does not ship. Deliberately a class attribute
+    # rather than a constructor argument: an argument is one `**cfg` away from
+    # being reachable from a config file, and the whole point of this floor is
+    # that a config file cannot lower it.
     enforce_gap_floor = True
 
     def __init__(
@@ -318,7 +361,12 @@ class Pacer:
         self.gap_floor_note: str | None = None
         self.min_gap, self.max_gap = self._floored(min_gap, max_gap)
         self.batch_size = batch_size
-        self.batch_rest = batch_rest
+        # The third number that reaches this class from `TELEGRAM_RESEARCH_CONFIG`
+        # and the only one nothing checked. A NaN rest is `max(gap, nan)` on
+        # every batch boundary and a NaN `sleep_cap`, which disarms the
+        # "reservation from the future" repair the same way NaN disarmed the gap
+        # floor -- every comparison against it is false.
+        self.batch_rest = self._finite(batch_rest, DEFAULT_BATCH_REST, "batch rest")
         self.path = Path(state_dir) / f"pace-{host.replace(':', '_')}.json"
         self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,6 +376,20 @@ class Pacer:
         if self.gap_floor_note:
             self._warn(self.gap_floor_note)
             self.last_warning = None      # a construction-time note is not a wait() one
+
+    def _finite(self, value, fallback: float, what: str) -> float:
+        """`value` as a finite number of seconds, or the shipped default, said aloud."""
+        try:
+            return float(config.want_finite_number({what: float(value)}, what))
+        except (TypeError, ValueError):
+            note = (
+                f"a t.me {what} that is not a finite number ({value!r}) was "
+                f"refused; using the shipped {fallback:g}s"
+            )
+            self.gap_floor_note = (
+                f"{self.gap_floor_note}; {note}" if self.gap_floor_note else note
+            )
+            return fallback
 
     def _floored(self, min_gap, max_gap) -> tuple[float, float]:
         """Clamp a requested gap up to the shipped default, and say when it did.
@@ -521,37 +583,6 @@ class Pacer:
         return slept
 
 
-class FastPacer(Pacer):
-    """A Pacer with the gap floor lifted. Tests only, and only for the pacer's
-    own tests: they exercise the reservation logic, which is about ordering and
-    not about duration, and at the shipped 2-4 s gap the suite would spend
-    minutes asleep to prove nothing extra.
-
-    Never reachable from the CLI: `tg.py build_web` constructs `Pacer`, and
-    nothing reads a class name out of the config. Anything that fetches for real
-    uses `Pacer` and gets the floor.
-    """
-
-    enforce_gap_floor = False
-
-
-class NullPacer(FastPacer):
-    """A pacer that never sleeps. Tests only -- never reachable from the CLI."""
-
-    def __init__(self) -> None:  # noqa: D107 - deliberately does not call super
-        self.min_gap = self.max_gap = 0.0
-        self.batch_size = 0
-        self.batch_rest = 0.0
-        self.path = Path(os.devnull)
-        self.lock_path = Path(os.devnull)
-        self.serialised_across_processes = False
-        self.last_warning = None
-        self.gap_floor_note = None
-
-    def wait(self) -> float:
-        return 0.0
-
-
 # --------------------------------------------------------------------------
 # The fetcher
 # --------------------------------------------------------------------------
@@ -588,6 +619,13 @@ class TelegramWeb:
         self.retry_backoff = retry_backoff
         self.request_count = 0
         self.aborted_reason: str | None = None
+        # WHICH surface said stop. A stop is sticky -- nothing may keep asking a
+        # host that refused -- but it is sticky for that host only: `discover`
+        # fetches lyzem through this same client, and a 503 or an interstitial
+        # from a third-party search engine used to close Telegram down as well,
+        # irreversibly and under a sentence that named Telegram as the refuser.
+        # Measured: `discover --lyzem-query "captcha"` could not complete at all.
+        self.aborted_host: str | None = None
 
     # -- low level ---------------------------------------------------------
     def fetch(
@@ -606,7 +644,7 @@ class TelegramWeb:
         502 used to reach the parsers, find no messages, and be reported as the
         end of a channel's history.
         """
-        if self.aborted_reason:
+        if self._blocked(url):
             raise RunAborted(self.aborted_reason)
 
         attempt = 0
@@ -627,7 +665,7 @@ class TelegramWeb:
             effective = None
             try:
                 with opener.open(req, timeout=self.timeout) as fh:
-                    raw = fh.read()
+                    raw = _read_body(fh, started + MAX_BODY_SECONDS)
                     status = fh.status
                     headers = {k.lower(): v for k, v in fh.headers.items()}
                     effective = _effective_url(fh)
@@ -635,7 +673,7 @@ class TelegramWeb:
                 body = _decode_text(data, headers)
             except urllib.error.HTTPError as exc:      # 3xx/4xx/5xx still carry a body
                 try:
-                    raw = exc.read()
+                    raw = _read_body(exc, started + MAX_BODY_SECONDS)
                     status = exc.code
                     headers = {k.lower(): v for k, v in exc.headers.items()}
                     effective = _effective_url(exc)
@@ -695,13 +733,15 @@ class TelegramWeb:
             if save_as and self.sources_dir:
                 label = _label_for(
                     save_as, status,
-                    refused="challenge" if challenge_page(body) else None,
+                    refused="challenge" if challenge_page(
+                        body, url=effective or url) else None,
                 )
                 target = _write_original(self.sources_dir, label, data)
                 resp.headers["x-saved-as"] = str(target)
 
             if stop:
                 self.aborted_reason = f"{url}: {stop}"
+                self.aborted_host = _host(url)
                 self._log(resp)
                 raise RunAborted(self.aborted_reason)
 
@@ -720,6 +760,19 @@ class TelegramWeb:
             return resp
 
     # -- accounting --------------------------------------------------------
+    def _blocked(self, url: str) -> bool:
+        """Has the surface this URL addresses already told this run to stop?
+
+        Per host, not per client. Telegram saying stop must not be worked around
+        by asking again, and a third-party surface saying stop must not close
+        Telegram: those are two facts about two hosts, and one field held both.
+        A reason set by hand -- with no host recorded -- blocks everything, which
+        is what it used to do.
+        """
+        if not self.aborted_reason:
+            return False
+        return self.aborted_host is None or _host(url) == self.aborted_host
+
     def _log(self, resp: Response) -> None:
         if self.on_fetch:
             self.on_fetch(resp)
@@ -750,6 +803,8 @@ class TelegramWeb:
         )
         self.request_count += 1
         self._log(resp)
+        if not worth_retrying(exc):
+            return False
         return self._retry(attempt)
 
     def _retry(self, attempt: int) -> bool:
@@ -796,6 +851,32 @@ class TelegramWeb:
         return self.fetch(url, follow=True, save_as=save_as)
 
 
+def worth_retrying(exc: BaseException) -> bool:
+    """Could a second attempt at this transport failure succeed?
+
+    The retry path exists for the flaky link: a timeout, a dropped connection, a
+    half-arrived body. It used to take every transport error alike, including
+    the two that are settled facts about this machine rather than about the
+    network -- a name that does not resolve and a certificate that does not
+    verify. Both cost three real attempts and two backoff sleeps (60 s + 120 s)
+    before the same error came back, which on a run of any size is minutes of
+    sleeping to re-learn what the first attempt established.
+
+    Anything not recognised is retried: the safe direction here is to spend one
+    more request, not to abandon a surface that would have answered.
+    """
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
+        # urllib wraps the real error -- DNS and TLS both arrive this way.
+        return worth_retrying(exc.reason)
+    if isinstance(exc, socket.gaierror):
+        return False                       # the name does not resolve; it will not
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False                       # the certificate will not verify either
+    if isinstance(exc, BodyTooLarge):
+        return False                       # it will be just as large next time
+    return True
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Hands the 3xx back instead of chasing it.
 
@@ -812,41 +893,76 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # Classification of a body
 # --------------------------------------------------------------------------
 def stop_signal(resp: Response) -> str | None:
-    """Return a sentence if this response means 'stop the run', else None.
+    """Return a sentence if this response means 'stop this surface', else None.
 
     Deliberately narrow. A refusal we understand -- a 302 on a group, a missing
     post -- is not a stop signal, it is data. A stop signal is the surface saying
     it no longer wants to talk, and the correct response to that is to stop and
     report, never to try again more politely.
+
+    **Which surface said it is part of the message.** The sentences all read
+    "from Telegram ... Run stopped", and `discover` fetches lyzem through the
+    same `fetch`, so a 503 from a third-party search engine was reported as
+    Telegram rate-limiting the run -- and, `aborted_reason` being sticky, every
+    later t.me request in the process raised the same sentence without going
+    near the network. `fetch` now closes only the surface that refused (see
+    `TelegramWeb._blocked`), and the wording says which one that is.
     """
+    telegram = from_telegram(resp.url_effective or resp.url)
+    who = "Telegram" if telegram else (_host(resp.url_effective or resp.url) or "the surface")
+    scope = "Run stopped" if telegram else "This surface stopped"
     if resp.status == 429:
-        return "HTTP 429 from Telegram — rate limited. Run stopped; nothing retried."
+        return f"HTTP 429 from {who} — rate limited. {scope}; nothing retried."
     if resp.status in (403, 503):
         # The status already carries the meaning here; the markers only choose
         # the wording, so prose is allowed to speak on this branch.
         if _challenge_marker(resp.body):
-            return f"HTTP {resp.status} with a challenge page — blocked. Run stopped."
-        return f"HTTP {resp.status} from Telegram. Run stopped."
+            return f"HTTP {resp.status} with a challenge page — blocked. {scope}."
+        return f"HTTP {resp.status} from {who}. {scope}."
     if resp.status == 200 and resp.bytes < SUSPICIOUS_BODY_BYTES:
         return (
             f"HTTP 200 with only {resp.bytes} bytes — the surface answered but said "
-            "nothing. Run stopped rather than treated as an empty result."
+            f"nothing. {scope} rather than treated as an empty result."
         )
-    if challenge_page(resp.body):
-        return "A challenge interstitial was served. Run stopped."
+    if challenge_page(resp.body, url=resp.url_effective or resp.url):
+        return f"A challenge interstitial was served. {scope}."
     return None
 
 
-def _challenge_marker(body: str) -> str | None:
-    """The first thing in this body that reads like an interstitial, if any."""
+def _host(url: str | None) -> str:
+    """The hostname of a URL, lowercased. `""` when it has none to give."""
+    try:
+        return (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    except ValueError:                          # a URL urlsplit cannot parse
+        return ""
+
+
+def from_telegram(url: str | None) -> bool:
+    """Did this URL address t.me itself?
+
+    A URL with no host at all counts as Telegram: it is a caller that built a
+    `Response` by hand, and the old, Telegram-only behaviour is the safe answer
+    for it. `endswith("t.me")` is deliberately not the test -- `nott.me` ends
+    with it.
+    """
+    host = _host(url)
+    return not host or host == "t.me" or host.endswith(".t.me")
+
+
+def _marker_in(body: str, markers) -> str | None:
     low = body.lower()
-    for marker in CHALLENGE_MARKERS:
+    for marker in markers:
         if marker in low:
             return marker
     return None
 
 
-def challenge_page(body: str) -> bool:
+def _challenge_marker(body: str) -> str | None:
+    """The first thing in this body that reads like an interstitial, if any."""
+    return _marker_in(body, CHALLENGE_MARKERS)
+
+
+def challenge_page(body: str, *, url: str | None = None) -> bool:
     """Is this body an anti-bot interstitial rather than a Telegram page?
 
     Structural first, prose second, and in that order for a reason. At HTTP 200
@@ -864,9 +980,20 @@ def challenge_page(body: str) -> bool:
     its prose says. The `tgme_page_wrap` half matters as much as the
     `data-post` half -- a landing card carries no `data-post` either, so gating
     on messages alone would still let a channel's own description abort a run.
+
+    **Off t.me, only the markup markers may answer.** Both structural guards are
+    t.me's own markup, so on a third-party surface neither can ever fire and the
+    test was back to being a substring search over prose -- on pages that are
+    search results, i.e. arbitrary text chosen by the query. Measured:
+    `discover --lyzem-query "captcha"` could not complete, because lyzem's
+    results page for that word contains that word. `url` is how the caller says
+    where the body came from; without it the body is treated as Telegram's, the
+    behaviour every existing caller had.
     """
     if PAGE_WRAP in body or DATA_POST in body:
         return False
+    if not from_telegram(url):          # `url=None` is Telegram, as it always was
+        return _marker_in(body, CHALLENGE_MARKUP_MARKERS) is not None
     return _challenge_marker(body) is not None
 
 
@@ -1021,8 +1148,22 @@ def online_count(landing_body: str) -> int | None:
     return int(digits) if digits else None
 
 
+# The extra line, matched as a CLASS rather than as a whole attribute value.
+# `class="tgme_page_extra"` demanded that this be the element's only class, so
+# one added class -- a styling variant, an A/B test -- made every landing page
+# read as carrying no extra line at all: `peer_type` fell through to `user`,
+# `member_count` and `online_count` to None, and a channel of millions came back
+# as `type: "user", members: null, exists: true`, which is the one verdict
+# `peer_type` documents as unfit for the registry. `\b` on both sides is what
+# keeps `tgme_page_extra_wide` from matching.
+_PAGE_EXTRA_RE = re.compile(
+    r"""class\s*=\s*["'][^"']*\btgme_page_extra\b[^"']*["'][^>]*>(.*?)</div>""",
+    re.I | re.S,
+)
+
+
 def _page_extra(landing_body: str) -> str | None:
-    m = re.search(r'class="tgme_page_extra"[^>]*>(.*?)</div>', landing_body, re.I | re.S)
+    m = _PAGE_EXTRA_RE.search(landing_body)
     if not m:
         return None
     return re.sub(r"<[^>]+>", " ", m.group(1))
@@ -1035,10 +1176,18 @@ def preview_available(resp: Response) -> bool:
     this surface, which is why the type always comes from the landing page. T2
     recorded a `url_effective` rule for telling them apart; it did not reproduce
     on 2026-08-23 and must not be used.
+
+    The message-wrap half is `_has_class`, not a substring of the document: this
+    was the last classifier in the file still asking "does this run of
+    characters occur anywhere", and it decides whether a walk stops. A post
+    quoting the class name would have made an unreadable page look served -- and
+    a served page look unreadable is the same defect from the other side, which
+    is the `found: 0` in the shape of a real ending that this skill exists to
+    never publish.
     """
     if resp.redirected:
         return False
-    return resp.status == 200 and MSG_WRAP in resp.body
+    return resp.status == 200 and _has_class(resp.body, MSG_WRAP)
 
 
 def search_found_nothing(body: str) -> bool:
@@ -1077,7 +1226,7 @@ def search_found_nothing(body: str) -> bool:
 def post_missing(embed_body: str) -> bool:
     """A missing message on `?embed=1`. HTTP is 200; the body says so in words.
 
-    A gap is not the end of history: `hanoi_chats` was live at 29327 while 29320,
+    A gap is not the end of history: `birding_chats` was live at 29327 while 29320,
     10000, 50000 and 200000 were all missing on the same day.
 
     Both halves of the old test were wrong on the only surface that uses it.
@@ -1144,6 +1293,98 @@ def _effective_url(handle) -> str | None:
     return None
 
 
+def _read_body(handle, deadline: float) -> bytes:
+    """Read one body, bounded in bytes and in wall clock.
+
+    Neither bound existed. `read()` with no argument buffers whatever the server
+    sends, and the `timeout` on the socket bounds a single operation rather than
+    the transfer, so a slow trickle is unbounded in both dimensions -- see
+    MAX_BODY_BYTES for the 200 MB that measured it.
+
+    Over-long and over-slow are both `TruncatedBody`: a body this module refused
+    to finish reading is a broken transfer, which is what that exception means
+    and what the retry path is for. What must never happen is the other thing --
+    handing a partial body to the parsers, where a page with no markers in it
+    reads as an empty surface, i.e. as absence.
+
+    **Which is why the short read is checked explicitly.** `read()` with no
+    argument raises `IncompleteRead` when the connection drops before the
+    declared `Content-Length`; `read(n)` deliberately does not (http.client says
+    so in a comment: "Ideally, we would raise IncompleteRead ... but it might
+    break compatibility"), it simply returns less. Reading in chunks without
+    this check would have converted a dropped connection into a short page --
+    the exact failure the exception exists to prevent.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_BODY_BYTES:
+        chunk = handle.read(min(READ_CHUNK_BYTES, MAX_BODY_BYTES + 1 - total))
+        if not chunk:
+            short = _unread_length(handle)
+            if short > 0:
+                raise TruncatedBody(
+                    f"the connection ended {short} bytes short of the declared "
+                    f"Content-Length ({total} bytes arrived). A part of a page "
+                    "is not a page and must never reach a parser."
+                )
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if time.time() > deadline:
+            raise BodyTooLarge(
+                f"the body was still arriving after {MAX_BODY_SECONDS:g}s "
+                f"({total} bytes so far). The per-request timeout bounds one "
+                "socket read, not the transfer; this is that bound."
+            )
+    raise BodyTooLarge(
+        f"the body passed {MAX_BODY_BYTES} bytes and was not read further. The "
+        "largest page in the probe corpus is 146 974 bytes, so nothing this "
+        "module can parse is this size."
+    )
+
+
+def _unread_length(handle) -> int:
+    """How much of the declared `Content-Length` never arrived.
+
+    `http.client.HTTPResponse.length` is what is still owed on the body, and it
+    is left standing when the connection drops. `urllib.error.HTTPError` proxies
+    attribute lookups to the response it wraps, so both paths through `fetch`
+    can be asked the same question; anything that cannot answer says 0, because
+    a body with no declared length cannot be short.
+    """
+    length = getattr(handle, "length", None)
+    if isinstance(length, int) and not isinstance(length, bool):
+        return length
+    return 0
+
+
+def _capped(data: bytes, what: str) -> bytes:
+    """`data`, or a `BodyTooLarge` saying it outgrew `MAX_BODY_BYTES`."""
+    if len(data) > MAX_BODY_BYTES:
+        raise BodyTooLarge(
+            f"the {what} body expanded past {MAX_BODY_BYTES} bytes and was not "
+            "decompressed further. A page this module can read is three orders "
+            "of magnitude smaller; this one is not a page."
+        )
+    return data
+
+
+def _inflate(raw: bytes, wbits: int) -> bytes:
+    """zlib, stopped at `MAX_BODY_BYTES` of OUTPUT rather than of input.
+
+    `zlib.decompress` raises on a stream that ends early; a `decompressobj` does
+    not -- it hands back what it has and leaves `eof` False. Reading the flag is
+    what keeps a half-arrived body from being decoded and parsed as a page, and
+    it is raised as the `zlib.error` the caller already knows how to handle.
+    """
+    obj = zlib.decompressobj(wbits)
+    data = _capped(obj.decompress(raw, MAX_BODY_BYTES + 1), "deflate")
+    data = _capped(data + obj.flush(), "deflate")
+    if not obj.eof:
+        raise zlib.error("incomplete or truncated deflate stream")
+    return data
+
+
 def _decompress(raw: bytes, headers: dict[str, str]) -> bytes:
     """Undo Content-Encoding, or say the transfer was broken.
 
@@ -1158,21 +1399,28 @@ def _decompress(raw: bytes, headers: dict[str, str]) -> bytes:
     `br` or `zstd` body. An unrecognised encoding is therefore not silently
     passed through as text -- that is the same "empty surface" failure by
     another road -- it is reported as the broken transfer it would be.
+
+    **The output is bounded as well as the input.** `MAX_BODY_BYTES` on the wire
+    says nothing about what comes out: 203 861 bytes of gzip expanded to 200 MB,
+    and the expansion is where the memory went. Every branch below stops at the
+    same ceiling and reports a `TruncatedBody` rather than returning the part it
+    managed to inflate.
     """
     enc = (headers.get("content-encoding") or "").lower()
     if "gzip" in enc:
         try:
-            return gzip.decompress(raw)
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as fh:
+                return _capped(fh.read(MAX_BODY_BYTES + 1), "gzip")
         # EOFError is what a gzip stream cut in half raises, and it is neither
         # an OSError nor a zlib.error -- it used to escape fetch() unhandled.
         except (OSError, EOFError, zlib.error) as exc:
             raise TruncatedBody(f"gzip body could not be decompressed: {exc}") from exc
     if "deflate" in enc:
         try:
-            return zlib.decompress(raw)
+            return _inflate(raw, zlib.MAX_WBITS)
         except zlib.error:
             try:
-                return zlib.decompress(raw, -zlib.MAX_WBITS)
+                return _inflate(raw, -zlib.MAX_WBITS)
             except (zlib.error, EOFError) as exc:
                 raise TruncatedBody(
                     f"deflate body could not be decompressed: {exc}"
@@ -1265,9 +1513,23 @@ def _uname(username: str) -> str:
     return urllib.parse.quote(username.lstrip("@").strip("/"), safe="")
 
 
+# The names Windows reserves for devices. `con.html` is not a file there --
+# it is the console -- and opening it for writing succeeds and writes nowhere,
+# so a saved original for `t.me/con` (or `nul`, `aux`, `prn`, `com3`) vanished
+# on that platform with no error anywhere. The skill is developed on Windows.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{n}" for n in range(1, 10)]
+    + [f"lpt{n}" for n in range(1, 10)]
+)
+
+
 def _safe_name(name: str) -> str:
-    cleaned = re.sub(r"[^\w.\-]+", "_", name)
-    return cleaned[:120] or "page"
+    cleaned = re.sub(r"[^\w.\-]+", "_", name)[:120] or "page"
+    # The device name is claimed by the stem, extension or not: `con.html` too.
+    if cleaned.partition(".")[0].lower() in _WINDOWS_DEVICE_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def _write_original(sources_dir: Path, save_as: str, payload: bytes) -> Path:
@@ -1310,7 +1572,10 @@ def _write_original(sources_dir: Path, save_as: str, payload: bytes) -> Path:
         suffix = f"-{n + 1}"
         candidate = sources_dir / (f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}")
         if n > 500:            # a runaway loop is worse than a collision
-            digest = hashlib.sha1(payload).hexdigest()[:8]
+            # `usedforsecurity=False` because this is a filename, not a
+            # signature: on a FIPS-enforcing build `hashlib.sha1(...)` raises
+            # outright, and that would turn a naming collision into a crash.
+            digest = hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:8]
             candidate = sources_dir / (f"{stem}-{digest}.{ext}" if ext else f"{stem}-{digest}")
             break
     with open(candidate, "wb") as fh:

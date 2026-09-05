@@ -518,11 +518,18 @@ def test_save_creates_the_run_folder_if_it_is_missing(tmp_path):
 # --------------------------------------------------------------------------
 # The two stoppers declared in config were read by nothing
 # --------------------------------------------------------------------------
-def test_query_log_can_be_built_from_the_budgets_that_declare_it():
+def test_the_two_stoppers_are_the_ones_the_budgets_declare():
+    """`config.Budgets` declares both stoppers, and `run.depth_ceilings` is the
+    one path that carries them into the brief a `QueryLog` is built from. Built
+    by hand instead, the class fell back to its own defaults and the configured
+    numbers changed nothing at all."""
     import config
+    import run as run_module
 
     budgets = config.Budgets(max_rounds=7, min_new_posts_per_round=11)
-    log = QueryLog.from_budgets(budgets)
+    ceilings = run_module.depth_ceilings("normal", budgets)
+    log = QueryLog(max_rounds=ceilings["max_rounds"],
+                   min_new_posts=ceilings["min_new_posts"])
     assert log.max_rounds == 7
     assert log.min_new_posts == 11
 
@@ -921,3 +928,121 @@ def test_the_saved_log_round_trips_exactly(tmp_path):
     assert back.to_state() == log.to_state()
     assert back.allows("взятка")[0] is False
     assert back.allows("рахмет")[0] is True
+
+
+# --------------------------------------------------------------------------
+# «the same word» is about endings, not about the first five letters
+# --------------------------------------------------------------------------
+def test_two_words_that_merely_start_alike_are_not_one_word():
+    """`MIN_STEM` + `MAX_ENDING` bound the SHAPE of the difference and cannot
+    bound its content: «аренда»/«арендой» and «столик»/«столица» have exactly
+    the same shape -- five shared letters, then one against two -- and one pair
+    is a word in two forms while the other is two different words.
+
+    So the drift ban handed out its certificate for «квартира»/«квартал»,
+    «столик»/«столица» and «визит»/«визитка», with the sentence "as a form of"
+    -- which is the line the calling agent quotes when it says a query came out
+    of the corpus rather than out of the model.
+    """
+    for a, b in [("квартира", "квартал"), ("столик", "столица"),
+                 ("визит", "визитка"), ("оплата", "оплаченный"),
+                 ("report", "reportedly"), ("band", "bandit")]:
+        assert querycraft.same_word(a, b) is False, f"{a} / {b}"
+
+    # And the tolerance the rule exists for is untouched, inflection by
+    # inflection.
+    for a, b in [("аренда", "аренды"), ("аренда", "арендой"),
+                 ("аренда", "аренде"), ("аренда", "арендами"),
+                 ("рахмет", "рахмету"), ("арендатор", "арендатору"),
+                 ("квартира", "квартирах"), ("report", "reported")]:
+        assert querycraft.same_word(a, b) is True, f"{a} / {b}"
+
+
+def test_the_drift_ban_refuses_a_word_that_only_shares_a_prefix():
+    """The same thing through the door the agent really uses."""
+    log = QueryLog()
+    log.record_posts([{"url": "u", "text": "сдаётся квартира в центре"}])
+    ok, why = log.allows("квартал")
+    assert ok is False, why
+    assert "refused as drift" in why
+    assert log.allows("квартиры")[0] is True     # the inflection still passes
+
+
+# --------------------------------------------------------------------------
+# The ban is keyed on the corpus it actually checks
+# --------------------------------------------------------------------------
+def test_a_corpus_of_short_words_does_not_switch_the_ban_off():
+    """`allows()` asked `corpus_tokens` whether there was a corpus and then
+    checked the phrase against `_token_seqs`. Those are two different
+    tokenisers: `corpus_tokens` keeps only words of three letters or more, so a
+    corpus that filled `_token_seqs` and left `corpus_tokens` empty switched the
+    ban off and admitted every invented query with the sentence "no corpus
+    retrieved yet" -- about a corpus that was there.
+    """
+    log = QueryLog()
+    assert log.record_posts([{"url": "u", "text": "да не ок ну да"}]) == 1
+    assert log.corpus_tokens == set(), "the premise: nothing clears the floor"
+    assert log._token_seqs, "and yet a corpus was retrieved"
+
+    ok, why = log.allows("аренда квартиры")
+    assert ok is False, why
+    assert "no corpus retrieved yet" not in why
+
+
+def test_a_corpus_of_two_character_words_does_not_switch_the_ban_off():
+    """The same hole with the corpus that made it obvious: Chinese and Japanese
+    write a great many words in two characters, and `TOKEN_RE` wants three."""
+    log = QueryLog()
+    log.record_posts([{"url": "u", "text": "北京 上海 東京"}])
+    assert log.corpus_tokens == set()
+    ok, why = log.allows("rent a flat")
+    assert ok is False, why
+    assert "no corpus retrieved yet" not in why
+
+
+def test_an_empty_corpus_still_says_the_question_is_the_seed():
+    """The other side of the same test: with nothing retrieved, the first round
+    has to be allowed to run at all."""
+    ok, why = QueryLog().allows("аренда квартиры")
+    assert ok is True
+    assert "no corpus retrieved yet" in why
+
+
+# --------------------------------------------------------------------------
+# The constructor checks what the restore path checks
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "three", None])
+def test_the_constructor_refuses_a_round_ceiling_that_is_not_a_number(value):
+    """`from_state` ran both numbers through the finite check and the
+    constructor did not, so a config override -- or any caller -- could hand in
+    `nan`, which makes every comparison false and removes the round ceiling in
+    silence. A hole with a door next to it."""
+    with pytest.raises(QueryLogError):
+        QueryLog(max_rounds=value)
+    with pytest.raises(QueryLogError):
+        QueryLog(min_new_posts=value)
+
+
+def test_a_round_ceiling_that_is_not_a_number_cannot_remove_the_ceiling():
+    """What the check is for: `nan` compared false, so `may_continue` said yes
+    for ever."""
+    log = QueryLog(max_rounds=1)
+    log.start_round(["аренда"])
+    assert log.may_continue()[0] is False
+
+
+# --------------------------------------------------------------------------
+# `exclude=` a bare string
+# --------------------------------------------------------------------------
+def test_excluding_one_phrase_written_as_a_string_still_excludes_it():
+    """A string is iterable, so `exclude="аренда"` excluded six single
+    characters -- none of them a token this method counts -- and the question's
+    own word came back at the top of the shortlist with nothing said about it.
+    """
+    log = QueryLog()
+    posts = [{"url": f"u{i}", "text": "аренды растут, депозит требуют"}
+             for i in range(4)]
+    terms = [t.term for t in log.candidates(posts, exclude="аренда", top=10)]
+    assert "аренды" not in terms
+    assert "депозит" in terms
+    assert "аренды" in log.last_mining["excluded_as_the_question"]

@@ -1,18 +1,17 @@
 ---
 name: telegram-research
 description: >-
-  Searches public Telegram for what people actually said about a subject: finds the channels and
-  groups that discuss it, works out the words those people use, reads the posts, and returns each
-  with a t.me permalink and a date. It also reads one named channel or group - recent posts, or
-  the whole history. Triggers - what do people say on Telegram about,
-  search Telegram for, find Telegram channels or groups on a topic, read this public channel,
-  pull a month of posts from a channel, search a channel's history, check this claim against
-  Telegram sources, make a Telegram report with sources, my Telegram account is frozen, how much
-  Telegram budget is left. Russian - поищи в телеге, что пишут в телеграме, найди телеграм-каналы,
-  что говорят в телеграм-чате про, найди посты в телеграме, почитай этот канал, проверь по
-  телеграму, правда ли, сделай отчёт по телеграму с источниками, телеграм-аккаунт заморожен,
-  сколько осталось лимита. Not for sending, joining or private chats - only public pages - and
-  not a post archive.
+  Searches public Telegram for what people said about a subject: finds the channels and groups
+  discussing it, learns their words, reads the posts, each with a t.me permalink and a date. Also
+  one named channel or group - recent posts, whole history, one t.me link, or whether it exists.
+  Triggers - what do people say on Telegram about, find Telegram channels or groups on a topic, read
+  this public channel, a month of posts, search a channel's history, open this t.me link, does this
+  channel exist, what do they call it there, check this claim on Telegram, Telegram report with
+  sources, Telegram account frozen, Telegram budget left. Russian - поищи в телеге, что пишут в
+  телеграме, найди телеграм-каналы, что говорят в чате про, найди посты в телеграме, почитай этот
+  канал, открой ссылку t.me, есть ли такой канал, как это называют в чатах, проверь по телеграму,
+  отчёт по телеграму с источниками, телеграм-аккаунт заморожен, сколько осталось лимита. Not for
+  sending, joining or private chats; not a post archive.
 allowed-tools: Read, Write, Edit, Glob, Grep, Agent, WebSearch, WebFetch, Bash(python:*), Bash(python3:*)
 ---
 
@@ -37,7 +36,7 @@ if [ -z "$TG" ]; then
   echo "SKILL.md, or run from the project root the skill is installed in." >&2
   exit 7
 fi
-if command -v python >/dev/null 2>&1; then python "$TG" selftest; else python3 "$TG" selftest; fi
+if command -v python3 >/dev/null 2>&1; then python3 "$TG" selftest; else python "$TG" selftest; fi
 ```
 
 **The refusal is the load-bearing half.** Without it an unmatched loop leaves `$TG` empty, the interpreter is
@@ -48,15 +47,16 @@ environment variable: the agent substitutes the real skill directory into this t
 agent that does not leaves it empty, so `[ -n "$p" ]` skips that candidate and the four standard locations
 are tried.)
 
-**Then keep using whichever interpreter that last line ran, spelled out.** macOS has shipped `python3` and no
-`python` since 12.3, so a block starting `python` dies on the first command for a large share of operators.
-Both are allowed, but the allow-list matches the literal word: a variable holding the interpreter's name
-matches neither entry and the call is refused before it runs. **Every `tg.py …` below means `python "$TG" …`
-or `python3 "$TG" …`** — interpreter first, nothing before it; the program sets its own streams to UTF-8, so
-an encoding prefix buys nothing.
+**Then keep using whichever interpreter that last line ran, spelled out.** `python3` is tried first because it
+is the name that means Python 3 everywhere: macOS has shipped it and no bare `python` since 12.3, and where a
+bare `python` does exist it is sometimes Python 2, which dies on the first command with a syntax error and
+exit **1** — the code this skill reserves for a crash. Both names are allowed, but the allow-list matches the
+literal word: a variable holding the interpreter's name matches neither entry and the call is refused before
+it runs. **Every `tg.py …` below means `python3 "$TG" …` or `python "$TG" …`** — interpreter first, nothing
+before it; the program sets its own streams to UTF-8, so an encoding prefix buys nothing.
 
-Python 3 is all that is needed until the account is used. The account path needs Telethon, and **this skill
-never installs it** — `pip install telethon` is the operator's decision; `scripts/account.py` says whether it
+**Python 3.9 or newer** is all that is needed until the account is used. The account path needs Telethon, and
+**this skill never installs it** — `pip install telethon` is the operator's decision; `scripts/account.py` says whether it
 is there. **Run `selftest` first**: it parses the saved probe pages (25 assertions, no network, any working
 directory) and separates "Telegram changed its front end" from "we broke something", exiting **9** when a
 parser no longer matches the pages — never 0 and never 1.
@@ -65,6 +65,11 @@ parser no longer matches the pages — never 0 and never 1.
 
 **A channel is free. A group has no free search surface at all, so searching one goes through the account —
 cheaply, and with no resolve.**
+
+**And the one thing to carry from the whole file: `contacts.resolveUsername` is the only call that has ever
+cost real downtime here.** Sixteen of them in under seven minutes bought a freeze of 36 468 seconds, and all
+sixteen returned success while the account was already dead. Nothing on an ordinary path reaches it; the full
+account rules are at the end of this file and in `references/account.md`.
 
 | what you want | the command | what it costs |
 | --- | --- | --- |
@@ -176,7 +181,8 @@ reads `ids` / `ids_seen`, never `len(messages)`.**
 the only one that asserts silence. Three more are zeroes that do not: `understood_nothing`, `surface_cap`, and
 `no_messages` — the preview page came back without a single message block, which is a statement about the fetch
 and the front end, never about the channel. Three are real endings, in descending strength: `first_post`,
-`until_id`, `no_more_pages`. Two are ceilings you set: `page_ceiling` and `aborted`.
+`until_id`, `no_more_pages`. Two are stops rather than endings: `page_ceiling`, the ceiling you set, and `aborted` — the walk was cut
+short by the request ceiling, a stop signal from the surface, or Ctrl-C.
 
 ## Stages
 
@@ -273,11 +279,15 @@ warns that all three stoppers bound nothing.
   over the whole history, with Russian morphology. `server_total` is Telegram's own count of matches, so
   `complete: false` means what it says and `--max-pages` is what to raise — a group is the one route where
   raising it does anything, the channel walks being capped at 25 whatever you pass.
-- **Group, recent messages:** the same `history` command — one call per 100 messages, newest first, so "what
-  are they talking about in there" is normally one call, obeying the same cursor rule.
+- **Group, recent messages:** the same `history` command — one call per 100 messages, newest first, obeying the
+  same cursor rule. **Pass `--max-pages 1` when one call is what you meant**: the default is 25, and the walk
+  keeps paying until a page comes back short.
 - **Group, one known id:** `tg.py group <name> --id N` — one GET, no account, for an id out of a permalink or a
   citation. `missing_ids` names ids that answered nothing, which is **ordinary** (124 consecutive empty ids
-  were measured between two live messages) and never evidence of silence.
+  were measured between two live messages) and never evidence of silence. `unreadable_ids` is the third
+  answer and a different fact: the page came back and carried no message this parser could read — a login
+  wall, or a front end that moved. **Never fold it into `missing_ids`**, and run `selftest` when it is not
+  empty.
 - **Group, bulk history:** the account, from Python. There is no CLI for a bulk read, deliberately — see
   `references/account.md`.
 
@@ -315,6 +325,7 @@ folder, not a target; `errors=0` is the thing to check. What it demands is in `r
    applies to them. What binds them is `--max-requests`: `run.json` accumulates the spend of every process
    sharing that `--run`, so agents launched under one run draw down one ceiling between them, and a branch that
    plans as if it had a fresh budget takes it from the branch beside it.
+
 The posts are primary sources with URLs and dates; the report's judgements are the agent's, and nothing in the
 run folder marks which is which.
 
@@ -349,8 +360,9 @@ run already going. **From the command line there is no third state**: without th
 at exit **7** and no account path opens. The dry run is a Python-API mode, described with the rest of the
 account's own flags in `references/cli.md`.
 
-`tg.py budget` says what has been spent today and whether resolving is frozen — no network call, no
-credential read, so it is always safe to ask. Its `--unfreeze --reason "..."` exists for a freeze that was
+`tg.py budget` says what has been spent today and whether the account is frozen — **both freezes**, the
+resolve ledger's and the history log's, and the second is the one a command line can actually earn: all three
+account subcommands gate on it. No network call, no credential read, so it is always safe to ask. Its `--unfreeze --reason "..."` exists for a freeze that was
 never Telegram's (a wrong clock, a test) and cannot tell that from a real one; **it is not a way to argue with
 a FloodWait, and waiting is the only thing that ends one.** What it prints, the `recorded: false` that has to
 be read, and what `scripts/account.py` adds to it are in `references/cli.md`.

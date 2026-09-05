@@ -41,6 +41,17 @@ zero-hit page).
 skill's own `scripts/tg.py`. The block that resolves it lives at the top of
 `SKILL.md` and is deliberately not repeated here; run it once per shell.
 
+### Peer names in this file
+
+`durov`, `telegram` and `tdlibchat` are the real public peers they look like.
+`birding_chats` is not: it is a stand-in for the public group the saved pages in
+`tests/fixtures/probes/` were captured from. Its handle, display name, avatar,
+numeric id and the text of its messages were all replaced, so nothing in these
+files names the group or the subject anybody was researching, and
+`t.me/birding_chats` is not the group the pages came from. What was NOT touched is what the parsers read and what
+this file measures: message ids, dates, counters, media and markup are as the
+pages served them, so every number here is the real measurement.
+
 ## Surface map
 
 | # | surface | URL shape | needs account? | covers channels | covers groups | yields | cost |
@@ -66,7 +77,7 @@ not a live test — see "What is NOT established".
 cannot find which ids exist, and at the measured density that is not a shortfall but an
 impossibility — see "Cost of the group path" below. A group is reached by rows 9-11,
 and they are cheap: 1 call to find the peer, then 1 call per page of up to 100 messages,
-**0 resolves**. Measured 2026-08-26: 100 recent messages of `hanoi_chats` for **one call**,
+**0 resolves**. Measured 2026-08-26: 100 recent messages of `birding_chats` for **one call**,
 against the ~10 000 GETs row 5 would need to find 100 live ids.
 
 ## Refusal-signal contract
@@ -86,10 +97,11 @@ downstream should re-derive these from the status line.
 | `?q=` search found nothing | the marker is an **element's class**, and the page carries no `data-post`. A page carrying `data-post` is never silence, whatever its text says | `/s/` page body, `NO_MESSAGES_FOUND` in `tgweb.py` | 200 |
 | message missing (embed) | the message div carries the class `err_message` (7 of 7 error pages, and nothing else), **or** the page carries no `data-post` and the literal `Post not found`. A page carrying `data-post` is never missing | embed page body, `POST_NOT_FOUND` in `tgweb.py` | 200 |
 | Telegram is rate-limiting | HTTP 429 | response status | 429 |
-| Cloudflare / challenge page | **structure first, prose second.** A body carrying `tgme_page_wrap` or `data-post` is Telegram answering and is never an interstitial, whatever words are in it. Only a body carrying neither is matched against `CHALLENGE_MARKERS` — fourteen strings, markup (`cdn-cgi/challenge-platform`, `cf_chl_opt`, `__cf_chl`) ahead of prose, because prose is localised and a script path is not | `challenge_page` and `CHALLENGE_MARKERS` in `tgweb.py` | 403 or 503, and 200 |
+| Cloudflare / challenge page | **structure first, prose second.** A body carrying `tgme_page_wrap` or `data-post` is Telegram answering and is never an interstitial, whatever words are in it. Only a body carrying neither is matched against `CHALLENGE_MARKERS` — fourteen strings, markup (`cdn-cgi/challenge-platform`, `cf_chl_opt`, `__cf_chl`) ahead of prose, because prose is localised and a script path is not. **Off `t.me` only the five markup markers are consulted**: the Telegram-shaped structural test cannot apply to a third party's page, and its ordinary prose must not read as a challenge | `challenge_page` and `CHALLENGE_MARKERS` in `tgweb.py` | 403 or 503, and 200 |
 | suspiciously small 200 | decoded body under `SUSPICIOUS_BODY_BYTES` = 500 bytes | any response | 200 |
 | the surface broke, and this is not an empty result | 5xx after `MAX_RETRIES` = 3 paced attempts, or any 4xx that is not 429 | `FetchFailed` in `tgweb.py` | 5xx / 4xx |
 | a truncated or undecompressable body | `IncompleteRead`, a half gzip stream, a deflate body that will not inflate | `TelegramWebError` naming the URL | any |
+| a body too big or too slow to be a page | over `MAX_BODY_BYTES` = 8 MiB on the wire or after decompression, or still arriving after `MAX_BODY_SECONDS` = 120 s. The largest page in the corpus is 146 974 bytes; a 200 KB gzip body that expands to 200 MB is what this measures | `BodyTooLarge` in `tgweb.py`, not retried | any |
 
 `.tme_no_messages_found` is the `?q=` search's own "no hits" marker — the CSS-class form of
 `NO_MESSAGES_FOUND = "tme_no_messages_found"` in `tgweb.py` — read as a **class on an
@@ -118,9 +130,12 @@ still let a channel's own description abort a run. The one place prose is allowe
 to speak alone is `stop_signal`'s 403/503 branch, where the status has already
 said what the body is and the markers only choose the wording.
 
-**`FetchFailed` and `RunAborted` are different facts.** `RunAborted` is Telegram saying stop
-(429, 403/503, a challenge page, a tiny 200): it latches, and every later `fetch` on the same
-client raises at once. `FetchFailed` is one request that broke: nothing latches, the next
+**`FetchFailed` and `RunAborted` are different facts.** `RunAborted` is a surface saying stop
+(429, 403/503, a challenge page, a tiny 200): it latches **per host**, and every later `fetch`
+at that host raises at once while the others keep working. A stop from `t.me` ends the run,
+because everything depends on it; a stop from a third-party index closes that index only.
+Before this was per host, one 429 from `lyzem` made every later read of `t.me` fail with a
+message about Telegram, and `discover --lyzem-query` could not finish at all. `FetchFailed` is one request that broke: nothing latches, the next
 request works, and the point of the class is that a 502 or a 404 must never reach a parser
 and be read as "no such message" or "search finished". Neither subclasses the other.
 
@@ -183,7 +198,6 @@ was not: its `service` row named a class that appears nowhere in the corpus.)
 | `attr_peer` | `data-peer` (attribute) | `"c<id>_<hash>"` — served on `?embed=1`, and the only id a GROUP has on any accountless surface. Kept verbatim in `Message.chat_peer`, never folded into `chat_id` |
 | `attr_datetime` | `datetime` (attribute) | ISO 8601, UTC |
 
-**A service message is a structure, not a class.** `is_service` is true for exactly **4 of
 > **What the denominators here count, because they are not the same number.**
 > The 58 probes of the full corpus are 51 HTML pages, 4 `.txt` and 3 `.xml`.
 > Counted on 2026-08-25:
@@ -196,7 +210,7 @@ was not: its `service` row named a class that appears nowhere in the corpus.)
 > rule gives 116/123, and inventing a third number would be worse than naming the
 > ambiguity.
 
-the 122 messages** in the 58 probes, and the rule is: on `/s/` the message div carries
+**A service message is a structure, not a class.** `is_service` is true for exactly **4 of the 122 messages** in the 58 probes, and the rule is: on `/s/` the message div carries
 `service_message`; on `?embed=1` a `message_media_not_supported_wrap` stands where the body
 would be, i.e. as a direct child of `tgme_widget_message_bubble`. Measured parents of that
 wrap across the corpus: 66 under `media_not_supported_cont` (the generic footer), 38 under
@@ -239,7 +253,7 @@ the entries of `media_urls` that are a still standing in for another file —
 | rounded view strings | Views arrive as `12.5M`, a string, never an integer. `views_raw` keeps the measurement; `views` (via `parse_rounded_count`) is a guess derived from it and can never recover the exact figure. Always keep both. | `tgparse.parse_rounded_count`, `Message.views_raw` |
 | `data-view` chat id, `-100` transform unverified | `data-view` is base64url JSON `{"c":...,"p":...,"t":...,"h":...}`, present only on channel `/s/` pages, identical across every message on the page. `c` = the chat's raw numeric id (e.g. `-1006503122` for @durov). **The relationship to the Bot-API `-100...` form (`-1001006503122`) is inferred, never verified against an authoritative id, and the code stores the raw value as measured.** Group embeds carry no `data-view` at all — groups have no id on this surface. | `tgparse._chat_id_from` / `tgparse.decode_data_view`; the `-100...` relationship is not established |
 | weak author identity | Display name always present on group embeds and channel signatures; public username present only when the sender has one and links to `t.me/<user>`; **user id never available** on any accountless surface. The record shape (`Message.author_username`) must not require a user id. | `tgparse._fill_from`, `Message.author_name` / `Message.author_username` |
-| id gaps are ordinary | On `hanoi_chats`, ids 29326/29327 were live while 29320, 10000, 50000, 200000 all answered `Post not found` the same day, and 124 consecutive empty ids sat between two live messages. So an empty id is never evidence that a group is quiet, and `group --id` reports the ones that answered nothing as `missing_ids` rather than dropping them. Whether gaps are deletions or unrenderable message types is NOT ESTABLISHED. | `tg.cmd_group` |
+| id gaps are ordinary | On `birding_chats`, ids 29326/29327 were live while 29320, 10000, 50000, 200000 all answered `Post not found` the same day, and 124 consecutive empty ids sat between two live messages. So an empty id is never evidence that a group is quiet, and `group --id` reports the ones that answered nothing as `missing_ids` rather than dropping them. Whether gaps are deletions or unrenderable message types is NOT ESTABLISHED. | `tg.cmd_group` |
 | the avatar is not the post's media | `media_urls` used to collect every `telesco.pe` URL under the message, so a one-line text post came back claiming an `.mp4` — the sender's animated profile photo. Three subtrees are excluded: `user_photo`, `link_preview` and the reply block. Measured after the fix: **0 of 122 messages claim `media_urls` without `media`.** | `tgparse._media_urls`, A09/95,97,103,106 |
 | the paging cursor is not the page's own URL | `_cursors` reads `<link rel="prev">`, then the `tme_messages_more` anchor, and never `rel="canonical"` — which is the page it is already on. C15 went from `before=441` (itself, an infinite loop or a wasted request) to `before=62`. | `tgparse._cursors` |
 | `bytes` is the DECODED size | It used to be the compressed length, so a 20 kB gzipped page read as "only 102 bytes" and tripped `stop_signal`'s tiny-body rule, aborting the run. The transfer size is kept separately as `wire_bytes`. The `bytes` in `fetchlog.jsonl` describes the file on disk, byte for byte — originals are written in binary, with no LF→CRLF rewriting. | `tgweb.Response` |
@@ -300,10 +314,10 @@ Four rules follow from that absence of data, not from a known number:
    channel answered a targeted question in one request that a full page-walk would have
    taken tens of requests to reach. Prefer it whenever the goal is
    "find X", not "have everything".
-4. **React to a signal, not a counter.** `stop_signal()` in `tgweb.py` aborts the whole run
-   on a 429, a challenge page, or a body under 500 bytes on a surface that should carry
-   content. Nothing retries in the hope the surface changed its mind; the run stops and
-   reports why.
+4. **React to a signal, not a counter.** `stop_signal()` in `tgweb.py` stops a surface on a
+   429, a challenge page, or a body under 500 bytes where content was due. Nothing retries in
+   the hope the surface changed its mind. A stop from `t.me` ends the run; a stop from a
+   third party closes that host and the run goes on with what it already paid for.
 
 ## Third-party surfaces — narrow roles only
 
@@ -313,7 +327,7 @@ results means its own index is thin, never that Telegram has nothing.
 | service | role | evidence it is narrow |
 |---|---|---|
 | `lyzem.com/search?q=<term>&f=messages&per-page=50` | source discovery and jargon/phrasing hints ONLY, at the discovery stage. Never a completeness check. | Self-reports **"51 results" for a single word as common as a large city's name**, measured live 2026-08-25 (the saved page is an authored stand-in, kept in the project repository at `tests/fixtures/probes/C20-lyzem-search.html`) — a term that common returning barely 51 hits says the index is far thinner than a full-text index of Telegram would need to be. Index size, retention, group coverage, rate limits and ToS are all NOT ESTABLISHED. |
-| `tg.i-c-a.su/rss/<name>` | **no role. Nothing calls it.** It existed to hand back a group's newest message id, which was only ever useful for guessing which ids to try — and that whole path is gone. | It is a hosted, logged-in third-party MTProto account behind an HTTP facade, not a scrape of the public preview — and it **misdescribes its own source**: its RSS `<channel><link>` field claims `https://t.me/s/hanoi_chats`, a URL that 302-redirects for that group. If it lies about where its own data comes from, nothing about its completeness or its future availability can be assumed. |
+| `tg.i-c-a.su/rss/<name>` | **no role. Nothing calls it.** It existed to hand back a group's newest message id, which was only ever useful for guessing which ids to try — and that whole path is gone. | It is a hosted, logged-in third-party MTProto account behind an HTTP facade, not a scrape of the public preview — and it **misdescribes its own source**: its RSS `<channel><link>` field claims `https://t.me/s/birding_chats`, a URL that 302-redirects for that group. If it lies about where its own data comes from, nothing about its completeness or its future availability can be assumed. |
 | catalogues — tgstat, telemetr, telegramchannels.me, telegago, tlgrm.ru | **none.** Measured 2026-08-25: all of them are closed **at the search step** (registration or payment), telegago answers 403, tlgrm.ru does not come up. tgstat's per-channel profile page is still open and is enrichment, not discovery. | Do not spend requests re-establishing this. The living free surfaces for finding sources are web search on `site:t.me`, `t.me/s/<channel>?q=`, lyzem, and the account's own search box. |
 
 ## What is NOT established
@@ -343,7 +357,7 @@ results means its own index is thin, never that Telegram has nothing.
 
 ## Cost of the group path, measured 2026-08-24 and 2026-08-25
 
-`?embed=1` costs one request per **id**, not per message. On `hanoi_chats`, a
+`?embed=1` costs one request per **id**, not per message. On `birding_chats`, a
 live public group of 2 835 members:
 
 | ids probed, from the head down | messages found | hit rate |

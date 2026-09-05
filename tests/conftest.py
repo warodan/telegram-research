@@ -181,10 +181,23 @@ class _FakeHandle:
         self.url = url
         self.status = status
         self._body = body
+        self._pos = 0
         self.headers = dict(headers)
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int | None = None) -> bytes:
+        """`http.client`'s signature: `read(n)` returns AT MOST n bytes.
+
+        `tgweb.fetch` reads a body in bounded chunks, so that a body far larger
+        than any real page cannot be buffered whole and a body that only
+        trickles cannot run for ever. A handle that ignored the size would make
+        both of those untestable and would not be what urllib hands it.
+        """
+        if amt is None or amt < 0:
+            chunk, self._pos = self._body[self._pos:], len(self._body)
+            return chunk
+        chunk = self._body[self._pos:self._pos + amt]
+        self._pos += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self

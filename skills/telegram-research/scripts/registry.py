@@ -35,7 +35,6 @@ from pathlib import Path
 import config as configmod
 
 VALID_TYPES = ("channel", "group")
-READABLE_TYPES = VALID_TYPES        # a "user" is a real peer and not a source
 VALID_STATUS = ("alive", "gone", "private", "unknown")
 VALID_FOUND_VIA = ("lyzem", "web", "link", "catalog", "manual", "registry",
                    # the account's own search box: `contacts.search`, which
@@ -163,16 +162,34 @@ class Source:
 class Registry:
     """A JSONL log of sources, read by streaming and written by appending."""
 
-    def __init__(self, path: Path, *, guard_timeout: float = 20.0):
+    def __init__(self, path: Path, *, guard_timeout: float | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.guard_timeout = guard_timeout
 
     # -- the write mutex ---------------------------------------------------
+
+    def _timeout(self) -> float:
+        """The guard timeout, read at call time.
+
+        A default argument is bound at import while its partner
+        `GUARD_STALE_AFTER` is read at call time, so anything that moved both
+        would have moved only one and silently inverted `timeout > stale_after`
+        -- the invariant that lets a waiter outlive a dead writer's guard.
+        """
+        return (configmod.GUARD_TIMEOUT if self.guard_timeout is None
+                else self.guard_timeout)
+
     def _guard(self) -> configmod.FileGuard:
+        # Both numbers from `config`, and the wait is longer than the
+        # staleness threshold there. They were 20 s and 120 s here: a writer
+        # killed mid-write blocked every registry write for two minutes,
+        # because the waiter always gave up a hundred seconds before the
+        # guard it was waiting on could be broken.
         return configmod.FileGuard(
             self.path.with_name(self.path.name + ".write"),
-            timeout=self.guard_timeout, stale_after=120.0, label="registry",
+            timeout=self._timeout(),
+            stale_after=configmod.GUARD_STALE_AFTER, label="registry",
         )
 
     # -- reading -----------------------------------------------------------
@@ -197,42 +214,57 @@ class Registry:
 
         A line that really does hold U+FFFD, encoded properly, still reads back
         as itself: the difference is now the bytes on disk, not the characters.
+
+        Read through `config.read_bytes_shared`, and in one go. A plain
+        `open("rb")` on NTFS does not pass FILE_SHARE_DELETE, and this is a
+        GENERATOR: the handle stayed open for as long as the caller took to
+        walk it, which is the whole of `load()` and therefore the whole of
+        almost every command. `compact()` replaces this same file, so one
+        ordinary reader was enough to fail it -- measured at 2.1 s and exit 9,
+        with the fresh `.bak` left on disk to poison the next attempt.
         """
         if not self.path.exists():
             return
-        with self.path.open("rb") as fh:
-            for lineno, raw in enumerate(fh, 1):
-                if lineno == 1:
-                    raw = raw.removeprefix(b"\xef\xbb\xbf")
-                try:
-                    line = raw.decode("utf-8").strip()
-                except UnicodeDecodeError as exc:
-                    # Salvage from a lossy decode: the username and the cursor
-                    # are ASCII in every record our own writer produces, so they
-                    # survive bytes the rest of the line did not.
-                    lossy = raw.decode("utf-8", "replace").strip()
-                    yield lineno, {"_corrupt": True,
-                                   "_why": f"not UTF-8: {exc}",
-                                   "_raw": lossy[:200], "_salvaged": _salvage(lossy)}
-                    continue
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    rec = json.loads(line, object_pairs_hook=_no_duplicate_keys)
-                except ValueError as exc:
-                    # One corrupt line must never cost the other ten thousand.
-                    # It is skipped and reported, not raised. `_salvaged` reads
-                    # the WHOLE line, not the 200-character preview: our own
-                    # writer sorts keys, so `username` is the last field in a
-                    # record and a truncated line loses it first.
-                    yield lineno, {"_corrupt": True, "_why": str(exc),
-                                   "_raw": line[:200], "_salvaged": _salvage(line)}
-                    continue
-                if not isinstance(rec, dict):
-                    yield lineno, {"_corrupt": True, "_why": "not a JSON object",
-                                   "_raw": line[:200], "_salvaged": _salvage(line)}
-                    continue
-                yield lineno, rec
+        try:
+            data = configmod.read_bytes_shared(self.path)
+        except FileNotFoundError:
+            return
+        # `split` and not `splitlines`: a lone `\r` inside a record must not
+        # become a line boundary, because the file handle this replaced did
+        # not treat it as one and the line numbers are what a damage report
+        # points an operator at.
+        for lineno, raw in enumerate(data.split(b"\n"), 1):
+            if lineno == 1:
+                raw = raw.removeprefix(b"\xef\xbb\xbf")
+            try:
+                line = raw.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                # Salvage from a lossy decode: the username and the cursor
+                # are ASCII in every record our own writer produces, so they
+                # survive bytes the rest of the line did not.
+                lossy = raw.decode("utf-8", "replace").strip()
+                yield lineno, {"_corrupt": True,
+                               "_why": f"not UTF-8: {exc}",
+                               "_raw": lossy[:200], "_salvaged": _salvage(lossy)}
+                continue
+            if not line or line.startswith("#"):
+                continue
+            try:
+                rec = json.loads(line, object_pairs_hook=_no_duplicate_keys)
+            except ValueError as exc:
+                # One corrupt line must never cost the other ten thousand.
+                # It is skipped and reported, not raised. `_salvaged` reads
+                # the WHOLE line, not the 200-character preview: our own
+                # writer sorts keys, so `username` is the last field in a
+                # record and a truncated line loses it first.
+                yield lineno, {"_corrupt": True, "_why": str(exc),
+                               "_raw": line[:200], "_salvaged": _salvage(line)}
+                continue
+            if not isinstance(rec, dict):
+                yield lineno, {"_corrupt": True, "_why": "not a JSON object",
+                               "_raw": line[:200], "_salvaged": _salvage(line)}
+                continue
+            yield lineno, rec
 
     def load(self) -> dict[str, dict]:
         """Collapse the log: username -> the newest record for it.
@@ -516,6 +548,10 @@ class Registry:
             backup = self.backup_path()
             if not force:
                 self._refuse_to_lose_the_backup(backup)
+            # Whether the backup below is one this call is about to create.
+            # Only such a backup may be removed again if the compaction then
+            # fails; one that was already there is somebody else's evidence.
+            backup_is_ours = not backup.exists()
             collapsed = {
                 key: {k: v for k, v in rec.items() if k not in DERIVED_FIELDS}
                 for key, rec in self.load().items()
@@ -538,7 +574,24 @@ class Registry:
             # A pid-stamped temp name, and a retried replace: the shared
             # `.compacting` name crashed one of two concurrent compactions with
             # an unhandled PermissionError in 3 of 5 trials.
-            configmod.atomic_write_text(self.path, body)
+            #
+            # The backup is written BEFORE this line, so a compaction that
+            # cannot replace the registry used to leave a `.bak` nobody asked
+            # for -- and the next attempt then refused with
+            # `_refuse_to_lose_the_backup`, describing an earlier `--force`
+            # compaction that never happened and offering `--force` as the way
+            # out. A backup this call created and could not earn is removed
+            # again; one that was already on disk is left alone.
+            replaced = False
+            try:
+                configmod.atomic_write_text(self.path, body)
+                replaced = True
+            finally:
+                if not replaced and backup_is_ours:
+                    try:
+                        backup.unlink()
+                    except OSError:
+                        pass
             return len(collapsed)
 
     def _refuse_to_lose_the_backup(self, backup: Path) -> None:

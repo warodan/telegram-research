@@ -26,7 +26,7 @@ from registry import AdmissionRules, Registry
 # --------------------------------------------------------------------------
 def test_parse_lyzem_candidates_snippets_and_claimed_count(probe):
     body = probe("C20-lyzem-search.html")
-    candidates, snippets, claimed = discover.parse_lyzem(body, "hanoi")
+    candidates, snippets, claimed = discover.parse_lyzem(body, "birding")
 
     assert claimed == 51
     assert len(snippets) == 10  # 10 result blocks on the saved page
@@ -49,7 +49,7 @@ def test_one_lyzem_result_is_one_sighting_not_two(probe):
     sightings where there was one.
     """
     body = probe("C20-lyzem-search.html")
-    candidates, snippets, _ = discover.parse_lyzem(body, "hanoi")
+    candidates, snippets, _ = discover.parse_lyzem(body, "birding")
 
     assert len(candidates) == len(snippets) == 10
     counted = Counter(c.username.lower() for c in candidates)
@@ -72,12 +72,12 @@ def test_parse_lyzem_on_unrelated_body_finds_nothing():
 # candidates_from_text
 # --------------------------------------------------------------------------
 def test_candidates_from_text_picks_up_both_forms_and_dedupes_case_insensitively():
-    text = "Check t.me/HanoiChats and also @hanoichats again, plus t.me/durov"
+    text = "Check t.me/BirdingChats and also @birdingchats again, plus t.me/durov"
     cands = discover.candidates_from_text(text, "web")
     usernames = [c.username for c in cands]
-    # HanoiChats and @hanoichats are the same name in different casing and
+    # BirdingChats and @birdingchats are the same name in different casing and
     # different forms (t.me/x vs @x) -- only the first-seen spelling survives.
-    assert usernames == ["HanoiChats", "durov"]
+    assert usernames == ["BirdingChats", "durov"]
     assert all(c.found_via == "web" for c in cands)
 
 
@@ -106,20 +106,20 @@ def test_every_official_link_form_is_recognised():
     stage 2 are exactly the ones that carry those forms.
     """
     blob = (
-        "join https://t.me/hanoi_chats and t.me/expatsinhanoi , @Hanoi_chat , "
-        "https://telegram.me/vietnam_chatt , http://telegram.dog/danang16 , "
-        "tg://resolve?domain=hanoi_forum , t.me/s/durov"
+        "join https://t.me/birding_chats and t.me/beginnerbirding , @Birding_chat , "
+        "https://telegram.me/wildlife_chatt , http://telegram.dog/finches16 , "
+        "tg://resolve?domain=birding_forum , t.me/s/durov"
     )
     found = [c.username for c in discover.candidates_from_text(blob, "web")]
 
-    assert set(found) == {"hanoi_chats", "expatsinhanoi", "Hanoi_chat",
-                          "vietnam_chatt", "danang16", "hanoi_forum", "durov"}
+    assert set(found) == {"birding_chats", "beginnerbirding", "Birding_chat",
+                          "wildlife_chatt", "finches16", "birding_forum", "durov"}
 
 
 @pytest.mark.parametrize("text", [
     "https://t.me/joinchat/AAAAAEabcdefg",
     "https://t.me/+iNvItEcOdE123",
-    "https://t.me/c/1931920118/29327",
+    "https://t.me/c/1000000001/29327",
     "https://t.me/proxy?server=1.2.3.4&port=443",
     "write to someone@example.tld about it",
 ])
@@ -140,17 +140,17 @@ def test_a_name_mentioned_five_times_outranks_one_mentioned_once():
     about which to try first.
     """
     catalogue = (
-        "t.me/hanoi_chats is the big one. t.me/hanoi_chats again, @hanoi_chats "
-        "and https://t.me/hanoi_chats plus telegram.me/hanoi_chats -- "
-        "t.me/expatsinhanoi once, and @admin_desk in the footer"
+        "t.me/birding_chats is the big one. t.me/birding_chats again, @birding_chats "
+        "and https://t.me/birding_chats plus telegram.me/birding_chats -- "
+        "t.me/beginnerbirding once, and @admin_desk in the footer"
     )
     result = discover.DiscoveryResult()
     for cand in discover.candidates_from_text(catalogue, "web"):
         result.add(cand)
     ranked = [(c.username.lower(), c.hits) for c in result.ranked()]
 
-    assert ranked[0] == ("hanoi_chats", 5)
-    assert dict(ranked)["expatsinhanoi"] == 1
+    assert ranked[0] == ("birding_chats", 5)
+    assert dict(ranked)["beginnerbirding"] == 1
     assert dict(ranked)["admin_desk"] == 1
 
 
@@ -259,10 +259,10 @@ def test_routing_furniture_is_dropped_under_a_named_reason():
     early on NOT_A_SOURCE with no note and no counter, so four names in and one
     candidate out looked exactly like a channel that found nothing."""
     result = discover.DiscoveryResult()
-    for name in ("telegram", "share", "proxy", "hanoi_chats"):
+    for name in ("telegram", "share", "proxy", "birding_chats"):
         result.add(discover.Candidate(name, "lyzem"))
 
-    assert list(result.candidates) == ["hanoi_chats"]
+    assert list(result.candidates) == ["birding_chats"]
     assert sum(result.dropped.values()) == 3
     assert len(result.notes) == 3
     assert any("telegram" in note for note in result.notes)
@@ -665,3 +665,52 @@ def test_a_card_with_no_type_never_reaches_the_registry_at_all(tmp_path):
     assert report.inserted == 0 and report.rejected == 1
     assert any("type is unknown" in reason for reason in report.reasons)
     assert not (tmp_path / "sources.jsonl").exists()
+
+
+# --------------------------------------------------------------------------
+# A name has to come from the right host
+# --------------------------------------------------------------------------
+def test_a_domain_that_merely_ends_in_t_me_is_not_a_telegram_link():
+    """The pattern had no left edge, so any host ending in one of the three
+    Telegram domains handed back its path as a channel name. Every phantom costs
+    one `t.me/<name>` GET to disprove and lands in `ranked()` with a hit, so it
+    also pushes real candidates down the list the agent is told to verify in
+    order."""
+    for text in ("see https://chatt.me/newsroom for more",
+                 "visit bestt.me/channel now",
+                 "http://first-t.me/somechannel",
+                 "read nottelegram.me/thing"):
+        assert discover.candidates_from_text(text, "web") == [], text
+
+
+def test_the_real_link_forms_all_still_match():
+    """The three official domains, the deep link, the `/s/` preview and the
+    protocol-relative href: none of them may be lost to the new left edge."""
+    for text, name in [("https://t.me/durov", "durov"),
+                       ("t.me/s/tdlibchat", "tdlibchat"),
+                       ("//t.me/birding_chats", "birding_chats"),
+                       ("https://telegram.me/durov", "durov"),
+                       ("https://telegram.dog/durov", "durov"),
+                       ("tg://resolve?domain=tdlibchat", "tdlibchat")]:
+        found = [c.username for c in discover.candidates_from_text(text, "web")]
+        assert found == [name], text
+
+
+def test_a_mail_domain_is_not_a_channel_handle():
+    """`@company.com` came back as the channel «company»: the `@` pattern had no
+    right edge, so a host was read as a handle."""
+    for text in ("пишите на @company.com",
+                 "our domain is @bigcorp.co.uk",
+                 "(@agency.ru)"):
+        assert discover.candidates_from_text(text, "web") == [], text
+
+
+def test_a_handle_at_the_end_of_a_sentence_still_matches():
+    """The right edge is a TLD, not any full stop: a dot followed by a space,
+    or by anything that is not Latin letters, leaves the handle alone."""
+    for text, name in [("подписывайтесь на @tdlibchat. Дальше — детали",
+                        "tdlibchat"),
+                       ("subscribe to @tdlibchat. Then read it", "tdlibchat"),
+                       ("наш канал @tdlibchat, заходите", "tdlibchat")]:
+        found = [c.username for c in discover.candidates_from_text(text, "web")]
+        assert found == [name], text

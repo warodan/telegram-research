@@ -148,6 +148,8 @@ def _repeated_lines(folded_texts: list[str]) -> dict[str, int]:
 
 # Deliberately small and multilingual. A long curated stop list is a place for a
 # subject word to hide: better to under-filter and let ranking sort it out.
+# The Russian half follows the Snowball/NLTK Russian stopword list, which is the
+# one every Russian text pipeline uses; the English half is hand-picked.
 STOPWORDS = {
     # ru
     "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то",
@@ -204,6 +206,30 @@ MIN_QUERY_TOKEN = 3      # matches TOKEN_RE: shorter than this is not a lead
 # worth following, and one the corpus really did say.
 MIN_STEM = 5
 MAX_ENDING = 3
+# What the two words are allowed to differ BY. `MIN_STEM` and `MAX_ENDING` bound
+# the shape of the difference and cannot bound its content: «аренда»/«арендой»
+# and «столик»/«столица» have exactly the same shape -- five shared letters,
+# then one letter against two -- and one pair is a word in two forms while the
+# other is two words. No rule about lengths can separate those, so this one is
+# about the letters: the tail each word is left with has to be an ENDING.
+#
+# Cyrillic first, because that is the language the drift ban was written for and
+# these are inflectional endings rather than derivational suffixes -- «-ка»,
+# «-ик», «-ица», «-тель» make a different word and are deliberately absent. Then
+# the English inflections, because a corpus of English posts is an ordinary case
+# here. `ё` is folded to `е` before this is consulted, so the `ё` forms are the
+# same strings. The bare consonants in the last Cyrillic row are not endings on
+# their own: prefix matching eats the vowel, so «аренда»/«арендами» is left
+# holding «ми» and «квартира»/«квартирах» «х». They are what is left of «ами»
+# and «ах» after the shared stem has taken the rest.
+INFLECTIONAL_ENDINGS = frozenset("""
+    а я о е и ы у ю ь й
+    ой ей ом ем ах ях ам ям ов ев ью ия ии ие ий ый ая яя ое ее ые их ых ым им
+    ую юю ей ет ит ут ют ат ят ла ло ли ть ти ся сь ем им те ешь ишь
+    ого его ому ему ами ями ыми ими ете ите
+    м х в го му ми
+    s es ed ing d ies
+""".split()) | {""}
 
 # The one query operator this skill's own examples use: a bare, upper-case OR
 # between two alternatives (`аренда OR квартиры`). It is detected on the query
@@ -253,8 +279,14 @@ class QueryLog:
     """
 
     def __init__(self, max_rounds: int = 3, min_new_posts: int = 3):
-        self.max_rounds = max_rounds
-        self.min_new_posts = min_new_posts
+        # The same check `from_state` runs, and for the same reason: both
+        # numbers arrive from a config override as well as from disk, and NaN
+        # passes `isinstance(x, float)` while making every comparison false --
+        # `max_rounds=nan` removed the round ceiling in silence. A constructor
+        # that accepted what the restore path refuses was a hole with a door
+        # next to it.
+        self.max_rounds = _want_whole(max_rounds, "max_rounds")
+        self.min_new_posts = _want_whole(min_new_posts, "min_new_posts")
         self.rounds: list[Round] = []
         self.terms: dict[str, JargonTerm] = {}
         self.seen_post_urls: set[str] = set()
@@ -272,17 +304,6 @@ class QueryLog:
         # removed -- each of them makes `candidates: []` or a short list mean
         # something quite different, and none of them was said out loud.
         self.last_mining: dict = {}
-
-    @classmethod
-    def from_budgets(cls, budgets) -> "QueryLog":
-        """Build one from `config.Budgets`, which is where the two numbers live.
-
-        `max_rounds` and `min_new_posts_per_round` were declared in `config` and
-        read by nothing: both stoppers ran on this class's own defaults, so
-        changing the budget changed nothing at all.
-        """
-        return cls(max_rounds=int(getattr(budgets, "max_rounds", 3)),
-                   min_new_posts=int(getattr(budgets, "min_new_posts_per_round", 3)))
 
     # -- the three stoppers ------------------------------------------------
     def may_continue(self) -> tuple[bool, str]:
@@ -354,7 +375,14 @@ class QueryLog:
         """
         if not _fold(query):
             return False, "empty query"
-        if not self.corpus_tokens:
+        if not self._token_seqs:
+            # Keyed on the sequences the check below really slides its window
+            # over, not on `corpus_tokens`. Those are two different tokenisers:
+            # `corpus_tokens` keeps only words of three letters or more, so a
+            # corpus of Chinese, of Japanese, or of nothing but short words
+            # filled `_token_seqs` and left `corpus_tokens` empty -- and the ban
+            # switched itself off, admitting every invented query with the
+            # sentence "no corpus retrieved yet" about a corpus that was there.
             return True, "no corpus retrieved yet — the question itself is the seed"
         branches = [b for b in _OR_SPLIT_RE.split(str(query).strip())]
         if len(branches) > 1:
@@ -551,7 +579,13 @@ class QueryLog:
         # ceiling.
         excluded = set(STOPWORDS)
         asked: set[str] = set()          # the question's and the seeds' own words
-        for phrase in exclude:
+        if isinstance(exclude, str):
+            # One phrase, not a sequence of letters. A string is iterable, so
+            # `exclude="аренда"` excluded six single characters -- none of them
+            # a token this method counts -- and the question's own word came
+            # back at the top of the shortlist with nothing said about it.
+            exclude = [exclude]
+        for phrase in exclude or ():
             folded = _fold(phrase)
             if not folded:
                 continue
@@ -890,7 +924,19 @@ def same_word(a: str, b: str) -> bool:
         common += 1
     if common < MIN_STEM:
         return False
-    return (len(a) - common) <= MAX_ENDING and (len(b) - common) <= MAX_ENDING
+    tails = (a[common:], b[common:])
+    if max(len(t) for t in tails) > MAX_ENDING:
+        return False
+    # And what is left over has to be an ending, not the rest of another word.
+    # Length alone handed the drift ban a certificate for «квартира»/«квартал»
+    # (five shared letters, then «ира» against «ал»), «столик»/«столица» and
+    # «визит»/«визитка»: three pairs of DIFFERENT words, admitted with the
+    # sentence "as a form of" -- the line the calling agent quotes when it says
+    # a query came out of the corpus rather than out of the model. The pairs the
+    # tolerance exists for differ by real endings and are untouched:
+    # «аренда»/«аренды», «аренда»/«арендой», «рахмет»/«рахмету»,
+    # «арендатор»/«арендатору».
+    return all(t in INFLECTIONAL_ENDINGS for t in tails)
 
 
 def _phrase_match(words: list[str], window: list[str]) -> list[str] | None:

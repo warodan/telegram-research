@@ -80,6 +80,11 @@ def _warn(message: str) -> None:
 # separate and flat on purpose: a layout change should be a diff to this table
 # and to nothing else. Values are class names unless the name says otherwise.
 # --------------------------------------------------------------------------
+# Four keys -- `not_supported`, `not_supported_cont`, `page_extra`, `page_photo`
+# -- are indexed by no line of this module and stay anyway. The table is checked
+# against `references/surfaces.md` key by key, so a selector dropped for being
+# unindexed takes with it what that file records about the surface. `page_extra`
+# is read elsewhere: `tgweb.py` matches the same class through a regex of its own.
 SEL = {
     "msg_wrap":        "tgme_widget_message_wrap",
     "msg":             "tgme_widget_message",
@@ -248,7 +253,7 @@ class Message:
     forwarded_from: str | None = None
     is_service: bool = False
     chat_id: int | None = None              # only on channel /s/ pages
-    # The raw `data-peer` value, verbatim: "c1931920118_4774030320557415984".
+    # The raw `data-peer` value, verbatim: "c1000000001_4000000000000000001".
     # It is served on ?embed=1 pages only, and it is the ONLY id a group has on
     # any accountless surface. Kept as the string it was served as rather than
     # folded into `chat_id`: for @durov `data-view`'s c is -1006503122 and
@@ -336,10 +341,31 @@ class PreviewPage:
         i.e. on the last page of a walk or a small `?q=` result. That is the
         safe direction: this verdict stops a walk, so a false positive
         truncates a live channel.
+
+        **A page on which every post is media is not accused.** A photo with no
+        caption carries no text and never did, and a full page of them is an
+        ordinary thing on a channel that posts pictures -- measured on a page of
+        20 caption-less photos, this said True, the walk stopped at
+        `understood_nothing` and 20 correctly parsed posts were thrown away as
+        unreadable. So a page where EVERY message came back carrying media is
+        left alone: the parse got something out of every block on it.
+
+        `all`, not `any`, and that is the whole subtlety. When the text selector
+        moves, the posts that carried media still have it -- A01 renamed is 8
+        media posts and 12 records with nothing in them at all -- so `any` would
+        have let the rename through on any page with one photo on it, which is
+        most of them. A record with neither text nor media is a block that
+        yielded nothing, and one of those on a full silent page is enough.
+
+        The price is a page that is BOTH entirely caption-less media and served
+        under a moved text selector, which goes unnoticed. That is the same
+        deliberate blind spot as the short page above, in the same direction.
         """
         if not self.messages or not self.is_full:
             return False
-        return not any(msg.text for msg in self.messages)
+        if any(msg.text for msg in self.messages):
+            return False
+        return not all(msg.media for msg in self.messages)
 
     @property
     def understood_nothing(self) -> bool:
@@ -515,7 +541,7 @@ def parse_embed(body: str, username: str, message_id: int, *,
                 source_file: str | None = None) -> Message | None:
     """One message. Returns None when the id carries no message.
 
-    None is not the end of history. On `hanoi_chats`, 29326 and 29327 were live
+    None is not the end of history. On `birding_chats`, 29326 and 29327 were live
     while 29320, 10000, 50000 and 200000 all answered `Post not found` on the
     same day. Whether that is deletion or an unrenderable message type is still
     unestablished, and either way a walk must keep going.
@@ -612,8 +638,17 @@ def _small_int(digits: str) -> int | None:
 # non-first ids are served. `?single` is what the link is for (open this ONE item
 # rather than the group), and it is what tells this link apart from the block's
 # own permalink.
+#
+# All three forms of the same link are accepted, because the surface is free to
+# serve any of them and this branch has no fixture: absolute
+# (`https://t.me/name/27043?single`), protocol-relative (`//t.me/name/27043
+# ?single`) and site-relative (`/name/27043?single`). Only the absolute one was
+# matched, so the other two lost the album's ids in silence -- with
+# `blocks_unparsed` at 0, because the block itself parsed perfectly.
+# A host other than t.me still cannot match: `https://example.com/name/1?single`
+# has no `/name` left to match after the optional `//t.me`.
 _ALBUM_HREF = re.compile(
-    r"^https?://t\.me/(?P<name>[A-Za-z0-9_]+)/(?P<id>\d+)\?single\b"
+    r"^(?:https?:)?(?://t\.me)?/(?P<name>[A-Za-z0-9_]+)/(?P<id>\d+)\?single\b"
 )
 
 
@@ -629,13 +664,16 @@ def _album_ids(wrap, name: str, mid: int) -> list[int]:
 
     Only ids under the same username are taken. An album carries links to its
     own items and nothing else, and a link to another channel is somebody
-    else's post, not a post this page served.
+    else's post, not a post this page served. The name is compared case-folded,
+    for the reason `_fetch_group_message` already compares its peer that way:
+    a link carries whatever case it was written in, and `DuRoV` and `durov` are
+    one channel. An exact comparison dropped every album id on such a page.
     """
     ids = {mid}
     for group in wrap.find_all(cls=SEL["grouped_wrap"]):
         for anchor in group.find_all(tag="a"):
             m = _ALBUM_HREF.match((anchor.attrs.get("href") or "").strip())
-            if not m or m.group("name") != name:
+            if not m or m.group("name").casefold() != name.casefold():
                 continue
             found = _small_int(m.group("id"))
             if found is not None:
@@ -695,7 +733,13 @@ def _fill_from(wrap, msg: Message) -> None:
         # never carried. Standard emoji do carry their character and keep it.
         for node in reactions.find_all(cls=SEL["reaction"]):
             label = node.text().strip()
-            rm = re.match(r"^(.*?)\s*([\d.,]+\s*[KMB]?)$", label)
+            # The count may carry a space INSIDE it: Telegram groups thousands
+            # with a narrow no-break space, so the digits after it were all the
+            # count matched: `👍 1 234` came back as the key `👍 1` with
+            # the count `234`, off by a thousand and under a key no caller can
+            # compare. `\s` inside the number covers every Unicode space, which
+            # is why none of them are listed here by hand.
+            rm = re.match(r"^(.*?)\s*([\d][\d.,\s]*[KMB]?)$", label)
             count = rm.group(2).strip() if rm else ""
             key = (rm.group(1).strip() if rm else label) or None
             if not key:
@@ -831,7 +875,7 @@ def _media_urls(wrap, inside_reply=frozenset()) -> tuple[list[str], list[str]]:
             urls.append(src)
         style = node.attrs.get("style")
         if style and "telesco.pe" in style:
-            for found in re.findall(r"url\(['\"]?([^'\")]+)", style):
+            for found in _css_urls(style):
                 if "telesco.pe" in found:
                     urls.append(found)
                     if node.has_class(SEL["video_thumb"]):
@@ -844,6 +888,31 @@ def _media_urls(wrap, inside_reply=frozenset()) -> tuple[list[str], list[str]]:
     return out, [url for url in out if url in posters]
 
 
+_CSS_URL = re.compile(
+    r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)""", re.S
+)
+
+
+def _css_urls(style: str) -> list[str]:
+    """Every `url(...)` value in a style attribute, quotes stripped.
+
+    A quoted CSS url may contain a closing parenthesis, and the pattern this
+    replaced stopped at the first one: a media URL whose `token=` carried a `)`
+    was cut in half, and half a URL downloads nothing while looking like a
+    record of the file. The quoted forms are read to their own quote and the
+    unquoted form to the closing bracket, which is the only place it may end.
+    """
+    out: list[str] = []
+    for m in _CSS_URL.finditer(style):
+        for value in m.groups():
+            if value is not None:
+                found = value.strip()
+                if found:
+                    out.append(found)
+                break
+    return out
+
+
 def _chat_id_from(root) -> int | None:
     """The channel's numeric id, decoded from `data-view`.
 
@@ -851,7 +920,7 @@ def _chat_id_from(root) -> int | None:
     appears -- greping the page for a `-100…` string returns nothing.
 
     Group embeds carry no `data-view`. They do carry `data-peer` on the same
-    div, which this docstring used to deny: `c1931920118_…` on hanoi_chats,
+    div, which this docstring used to deny: `c1000000001_…` on birding_chats,
     `c1279877202_…` on tdlibchat. That value is kept verbatim in
     `Message.chat_peer` -- it is the only id a group has on this surface, and
     on @durov, where both attributes are present, `data-peer`'s first component

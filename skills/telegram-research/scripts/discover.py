@@ -8,7 +8,7 @@ have both produced candidates. One channel agreeing with itself is not
 corroboration, and each of the four has a different blind spot:
 
 * `lyzem` searches message text across many channels, and its index is thin --
-  51 hits for a word as common as "hanoi". It sees a small share and does not
+  51 hits for an everyday word. It sees a small share and does not
   say which share.
 * Ordinary web search sees what Google indexed, which for a group is only the
   landing page -- and a group's landing page carries no messages at all.
@@ -41,12 +41,23 @@ from registry import AdmissionRules, Registry, Source, TopicClassifier, judge, t
 # stage 2 are exactly the ones that carry them, so it was a whole source
 # silently never entering a run. Measured on a catalogue-shaped blob naming nine
 # peers: three of them missed.
+#
+# Both patterns are anchored to a host boundary, which they were not.
+# The left edge is the lookbehind on the host: without it the host had no
+# beginning, so any domain ENDING in one of these -- `chatt.me/newsroom`,
+# `bestt.me/channel`, `first-t.me/...` -- handed back the path as a channel
+# name. The lookahead on `AT_RE` is the right edge: `@company.com` is a mail
+# domain and came back as the channel «company». Each phantom costs one
+# `t.me/<name>` GET to disprove and lands in `ranked()` with a hit, so it also
+# pushes real candidates down the list the agent is told to verify in order. A
+# handle at the end of an English sentence keeps working: a dot followed by a
+# space is not a TLD.
 USERNAME_RE = re.compile(
-    r"(?:(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?"
+    r"(?<![\w-])(?:(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?"
     r"|tg://resolve\?domain=)([A-Za-z0-9_]{4,32})\b",
     re.I,
 )
-AT_RE = re.compile(r"(?<![\w/])@([A-Za-z0-9_]{4,32})\b")
+AT_RE = re.compile(r"(?<![\w/])@([A-Za-z0-9_]{4,32})\b(?!\.[A-Za-z]{2,})")
 
 # t.me paths that are routing furniture rather than a peer, plus the handful of
 # self-promotion accounts the discovery services inject into their own pages.

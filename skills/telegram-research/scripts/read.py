@@ -132,6 +132,24 @@ def _page_ids_seen(page) -> int:
     return len({i for m in page.messages for i in _ids_of(m)})
 
 
+def _page_is_full(page) -> bool:
+    """`PreviewPage.is_full` -- ids OR blocks, whichever is the larger count.
+
+    Read off the page rather than recomputed, because "was this page full" has
+    to be answered the same way everywhere: `tgparse._cursors` decides whether
+    to fall back to a cursor with it, and this module decides with it whether a
+    `?q=` search that stopped had been capped or had run out of hits. Counting
+    only the ids seen -- which is what this did -- reads a page of 20 blocks of
+    which 3 did not parse as a SHORT page, i.e. as the end of the matches, i.e.
+    as `exhausted: true` on a search the surface had truncated.
+    """
+    full = getattr(page, "is_full", None)
+    if isinstance(full, bool):
+        return full
+    blocks = int(getattr(page, "blocks_seen", 0) or 0)
+    return max(_page_ids_seen(page), blocks) >= PAGE_SIZE
+
+
 def _page_min_id(page) -> int | None:
     """The smallest id ON the page -- `min(ids)`, never `min(m.id)`."""
     ids = [i for m in page.messages for i in _ids_of(m)]
@@ -161,7 +179,6 @@ class ReadResult:
     reached_until_id: bool = False    # caught up with what a previous run stored
     no_more_pages: bool = False       # the surface published no further cursor
     stop_reason: str | None = None    # short code naming which of these ended it
-    mismatched: int = 0               # pages that answered with another id or peer
     understood_nothing: bool = False  # a page carried message blocks and parsed none
     blocks_unparsed: int = 0          # how many blocks went unread across the walk
     # The `?q=` surface stopped serving while its first page was FULL. That is
@@ -171,10 +188,6 @@ class ReadResult:
     # an album is one message block carrying several ids, so the two differ by
     # however many albums the walk crossed.
     ids_seen: int = 0
-    # `requests` is the walk's COST in network acts (a retry is two). `ids_tried`
-    # is how many ids it asked about, which is what the density and the miss
-    # tolerance are about. Equal unless something had to be retried.
-    ids_tried: int = 0
 
     def _end(self, reason: str) -> None:
         """Mark a natural end -- the walk ran out of material, not of budget."""
@@ -242,11 +255,22 @@ class ReadResult:
             return False
         self.understood_nothing = True
         self.stop_reason = "understood_nothing"
+        # `understood_nothing` has two shapes and this sentence described one of
+        # them for both. In the second, every block on the page DID parse and
+        # none of them carries a word of text -- the text selector has moved --
+        # and telling the reader "not one of them parsed" sends whoever repairs
+        # it looking at `data-post`, which is the half that still works.
+        blocks = getattr(page, "blocks_seen", 0)
+        if not getattr(page, "messages", None):
+            what = (f"{blocks} message blocks on this page and not one of them "
+                    "parsed — the markup this skill reads has changed")
+        else:
+            what = (f"{len(page.messages)} message blocks on this page all "
+                    "parsed and not one of them carries any text — the text "
+                    "selector has moved")
         self.stopped_early = (
-            f"{getattr(page, 'blocks_seen', 0)} message blocks on this page and "
-            "not one of them parsed — the markup this skill reads has changed. "
-            "That is a front-end change to report, NOT an empty page: nothing "
-            "here is evidence that the channel said nothing"
+            f"{what}. That is a front-end change to report, NOT an empty page: "
+            "nothing here is evidence that the channel said nothing"
         )
         return True
 
@@ -338,6 +362,22 @@ def search_channel(web, username: str, query: str, *, max_pages: int = 5,
                     result._search_end("no_more_pages",
                                        first_page_full=first_page_full)
                 break
+            # A `/s/` page with no message block on it at all, and without the
+            # zero-hit marker the branch above reads. `walk_channel` has always
+            # stopped here; this route did not, and ran on to the cursor test,
+            # where a page carrying no cursor either ended the search as
+            # `no_more_pages` -- `found: 0, exhausted: true, found_nothing:
+            # false`, which is a false zero wearing the shape of a real ending.
+            # Nothing about such a page says the query matched nothing: it is a
+            # front end that changed, a wall, or a surface having a bad minute.
+            if not preview_available(resp):
+                result.stopped_early = (
+                    "the ?q= page carried no message blocks and no zero-hit "
+                    "marker either — nothing here says the query matched "
+                    "nothing, so this search is unfinished, not empty"
+                )
+                result.stop_reason = "no_messages"
+                break
             page = tgparse.parse_preview(
                 resp.body, username, found_by=query,
                 source_file=resp.headers.get("x-saved-as"),
@@ -355,7 +395,7 @@ def search_channel(web, username: str, query: str, *, max_pages: int = 5,
             result.pages += 1
             result.ids_seen = len(seen)
             if page_no == 0:
-                first_page_full = _page_ids_seen(page) >= PAGE_SIZE
+                first_page_full = _page_is_full(page)
             # The last page of hits ends the search HERE, without paying a
             # request to be told the next one is empty. That rests entirely on
             # `tgparse._cursors` returning `before=None` for a page that
@@ -494,8 +534,18 @@ def _fetch_group_message(web, username: str, message_id: int, *,
                          save_prefix: str | None = None):
     """One group message. Returns `(message | None, verdict)`.
 
-    Verdict is `"hit"`, `"missing"` or `"wrong_post"`. The third one is why this
-    exists: `parse_embed` takes the id and the username from the page's own
+    Verdict is `"hit"`, `"missing"`, `"unreadable"` or `"wrong_post"`.
+
+    `"unreadable"` is `tgweb.embed_unreadable`'s third answer, and it was being
+    given as `"missing"`. "This id carries no message" and "this page is not one
+    this skill can read" are different facts: the first is data -- a gap, a
+    deletion -- and the second is a front-end change, a join wall or an
+    interstitial. Reported as the first, a stretch of unreadable pages is a
+    stretch of proven-empty ids, and a walk ends on it saying the group's
+    history stops there while the group is still talking.
+
+    `"wrong_post"` is why this function exists at all: `parse_embed` takes the
+    id and the username from the page's own
     `data-post`, and `tgweb.embed` fetches with `follow=True`, so a redirect is
     chased. An id that redirects to a linked discussion group or to a renamed
     peer used to be appended as if it were the id that was asked for -- counted
@@ -513,8 +563,8 @@ def _fetch_group_message(web, username: str, message_id: int, *,
     The two comparisons below repeat the parser's, deliberately: this is the
     walk's own guarantee that it never books a hit for an id it did not receive,
     and it must not depend on a flag another module remembers to set. The peer
-    match is case-insensitive, so a landing page answering `HanoiChats` for
-    `hanoi_chats` is the same peer, not a mismatch.
+    match is case-insensitive, so a landing page answering `BirdingChats` for
+    `birding_chats` is the same peer, not a mismatch.
     """
     message_id = _want_count(message_id, "message_id")   # a named refusal
     label = f"{save_prefix or username}-{message_id}.html" if save_prefix else None
@@ -526,25 +576,16 @@ def _fetch_group_message(web, username: str, message_id: int, *,
         source_file=resp.headers.get("x-saved-as"),
     )
     if msg is None:
-        return None, "missing"
+        # The `post_missing` test is repeated deliberately, exactly as the two
+        # comparisons below repeat the parser's: a miss is only ever booked
+        # against a page that PROVES the id is empty, and never against one that
+        # merely failed to parse.
+        return None, ("missing" if post_missing(resp.body) else "unreadable")
     same_peer = (msg.username or "").lstrip("@").casefold() == username.lstrip("@").casefold()
     if getattr(msg, "requested_id", None) is not None or msg.id != int(message_id) \
             or not same_peer:
         return None, "wrong_post"
     return msg, "hit"
-
-
-def read_group_message(web, username: str, message_id: int, *,
-                       save_prefix: str | None = None):
-    """One group message, one HTTP request. Returns None when the id is empty.
-
-    None also covers a page that came back for a different id or a different
-    peer -- see `_fetch_group_message`. Nothing that was not asked for is ever
-    returned from here.
-    """
-    msg, _verdict = _fetch_group_message(web, username, message_id,
-                                         save_prefix=save_prefix)
-    return msg
 
 
 def _slug(text: str, limit: int = 24) -> str:

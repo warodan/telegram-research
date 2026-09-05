@@ -94,6 +94,41 @@ MAX_FREEZE_SEC = 2 * 86400.0
 UNREADABLE_FREEZE_SEC = 3600.0
 
 
+def freeze_seconds(seconds) -> tuple[float, str]:
+    """How long to freeze for, and a note when that is not what was asked.
+
+    Never raises and never returns zero for a value it could not read: a
+    `freeze` call happens because Telegram has already said no, so refusing to
+    record it is the fail-open direction. See `MAX_FREEZE_SEC`.
+
+    Module level rather than a method because there are two freezes in this
+    skill and they had two different rules: `account.HistoryLog.freeze` applied
+    no ceiling at all (a billion seconds went to disk verbatim -- 31 years) and
+    raised on a value it could not read, writing nothing, which is the fail-open
+    direction on the one call the CLI can really earn a freeze with. Both call
+    this now, so neither can drift from the other again.
+    """
+    try:
+        value = float(configmod.want_finite_number({"seconds": seconds}, "seconds"))
+    except ValueError:
+        return UNREADABLE_FREEZE_SEC, (
+            f"the wait was given as {seconds!r}, which is not a number of "
+            f"seconds; frozen for {UNREADABLE_FREEZE_SEC:.0f} s instead"
+        )
+    if value < 0:
+        return UNREADABLE_FREEZE_SEC, (
+            f"the wait was given as {value:.0f} s, which is not a wait; frozen "
+            f"for {UNREADABLE_FREEZE_SEC:.0f} s instead"
+        )
+    if value > MAX_FREEZE_SEC:
+        return MAX_FREEZE_SEC, (
+            f"the wait was given as {value:.0f} s, longer than this machine "
+            f"will freeze for; clamped to {MAX_FREEZE_SEC:.0f} s. A wait that "
+            "long is a clock, not a ban — `tg.py budget --unfreeze` lifts it"
+        )
+    return value, ""
+
+
 class BudgetExhausted(RuntimeError):
     """The call is refused by our own accounting, before Telegram sees it."""
 
@@ -283,6 +318,15 @@ def _process_identity(pid: int) -> str | None | bool:
             return ""                    # a zombie has exited; nobody reaped it
         return f"posix:{fields[19].decode()}"
     except FileNotFoundError:
+        # A missing `/proc/<pid>/stat` means the process is gone -- but only on
+        # a machine that HAS `/proc`. macOS has none, so every pid on it read as
+        # "definitely dead", `_is_stale` broke the lock of a run that was still
+        # working, and two writers went at one account. The opposite reading is
+        # no better: with no opinion at all a crashed run holds the account for
+        # the full 1800 s. `None` is what this function has for "this machine
+        # will not say", and that is the honest answer here.
+        if not os.path.isdir("/proc"):
+            return None
         return ""
     except Exception:
         return None
@@ -320,6 +364,58 @@ def _want_int(data: dict, key: str) -> int:
 
 def _want_float(data: dict, key: str) -> float:
     return float(_want_number(data, key))
+
+
+# Two readings of `time.time() - time.monotonic()` taken microseconds apart
+# still differ by the time between the two calls, so the estimate needs a little
+# slack before two of them may be called the same boot.
+BOOT_SLACK_SEC = 5.0
+
+
+def same_boot(boot_at_freeze: float, mono_at_freeze: float, mono_now: float) -> bool:
+    """Is `time.monotonic()` still counting from the boot that took the freeze?
+
+    A monotonic deadline is only comparable within one boot, and the test used
+    to be `mono_now >= mono_at_freeze` -- which is true again after ANY reboot,
+    as soon as the new uptime passes the old one. Measured: a wall deadline
+    three days expired, a freeze still held, and (before `clear_freeze`) no way
+    out of it at all.
+
+    So the freeze records `time.time() - time.monotonic()`, an estimate of the
+    moment the machine booted, and this compares it with the same estimate
+    taken now. Equal, near enough, means the same boot.
+
+    **Both readings come from THIS machine's clock, never from a caller's
+    `now`.** The estimate was written from the real clock, so only the real
+    clock may be compared with it -- and the case the monotonic twin exists for
+    is exactly a caller reasoning about a wall-clock moment the machine itself
+    does not agree with.
+
+    Unequal is where the care is, because the monotonic twin exists for the case
+    that ALSO moves the estimate: a wall clock jumping forward moves it by the
+    size of the jump, and an eleven-hour NTP correction ending a ten-hour wait
+    Telegram was still enforcing is the incident that put the twin here. The two
+    are told apart by how far the estimate moved:
+
+    * backwards -- the clock was set back. The wall deadline is then the longer
+      of the two anyway, so the monotonic one is not needed and not trusted.
+    * forward by LESS than the uptime the freeze was taken at -- a reboot cannot
+      do that: it moves the estimate by the old uptime plus the downtime, both
+      of which it must pay in full. So this is a clock jump on the same boot,
+      and the monotonic deadline stands.
+    * forward by at least that much -- a reboot is possible, and a monotonic
+      deadline that may belong to a previous boot is not evidence of anything.
+    """
+    if not boot_at_freeze:
+        # Written by a version that did not record it, or hand-edited away.
+        # There is no evidence of the boot, so there is nothing to trust.
+        return False
+    shift = (time.time() - mono_now) - boot_at_freeze
+    if abs(shift) <= BOOT_SLACK_SEC:
+        return True
+    if shift < 0:
+        return False
+    return shift < max(float(mono_at_freeze), 0.0)
 
 
 def _want_now(now):
@@ -417,6 +513,11 @@ class LedgerState:
     # can move. Whichever deadline is later wins.
     frozen_until_mono: float = 0.0
     mono_at_freeze: float = 0.0
+    # `time.time() - time.monotonic()` at the moment of the freeze: an estimate
+    # of when this machine booted. `same_boot` compares it with the same
+    # estimate taken later, because a monotonic deadline from another boot is
+    # not a deadline at all.
+    boot_at_freeze: float = 0.0
     # Resolves that have been counted but whose outcome is not yet settled. The
     # rule in `references/account.md` is that a resolve is counted BEFORE it
     # happens; this list is what makes that true across a kill mid-call.
@@ -453,9 +554,20 @@ class ResolveLedger:
                  burst_window: int = BURST_WINDOW_SEC,
                  min_gap: float = MIN_RESOLVE_GAP_SEC,
                  join_ceiling: int = DAILY_JOIN_CEILING,
-                 guard_timeout: float = 10.0):
+                 guard_timeout: float | None = None):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # `HistoryLog` already wraps its copy of this line and this one was
+            # left bare, so a `TELEGRAM_RESEARCH_STATE` pointing at a drive that
+            # is not there answered with a raw `FileNotFoundError` out of a
+            # module that promises only its own types -- from a CONSTRUCTOR,
+            # before any caller had a chance to ask it anything.
+            raise LedgerWriteFailed(
+                f"the state directory {self.path.parent} could not be created: "
+                f"{exc}. Nothing was read and nothing was recorded."
+            ) from None
         self.daily_ceiling = daily_ceiling
         self.burst_ceiling = burst_ceiling
         self.burst_window = burst_window
@@ -464,6 +576,17 @@ class ResolveLedger:
         self.guard_timeout = guard_timeout
         self._fingerprint = ""
         self.fingerprint = fingerprint
+
+    def _timeout(self) -> float:
+        """The guard timeout, read at call time.
+
+        A default argument is bound at import while its partner
+        `GUARD_STALE_AFTER` is read at call time, so anything that moved both
+        would have moved only one and silently inverted `timeout > stale_after`
+        -- the invariant that lets a waiter outlive a dead writer's guard.
+        """
+        return (configmod.GUARD_TIMEOUT if self.guard_timeout is None
+                else self.guard_timeout)
 
     # -- the login session this ledger belongs to --------------------------
     @property
@@ -502,7 +625,8 @@ class ResolveLedger:
     def _guard(self) -> configmod.FileGuard:
         return configmod.FileGuard(
             self.path.with_name(self.path.name + ".rmw"),
-            timeout=self.guard_timeout, stale_after=60.0, label="ledger",
+            timeout=self._timeout(), stale_after=configmod.GUARD_STALE_AFTER,
+            label="ledger",
         )
 
     # -- state -------------------------------------------------------------
@@ -562,6 +686,7 @@ class ResolveLedger:
                 fingerprint=_want_str(data, "fingerprint"),
                 frozen_until_mono=_want_float(data, "frozen_until_mono"),
                 mono_at_freeze=_want_float(data, "mono_at_freeze"),
+                boot_at_freeze=_want_float(data, "boot_at_freeze"),
                 pending=_want_reservations(data, "pending"),
             )
         except (ValueError, TypeError) as exc:
@@ -653,6 +778,7 @@ class ResolveLedger:
             if disk.frozen_until_mono > state.frozen_until_mono:
                 state.frozen_until_mono = disk.frozen_until_mono
                 state.mono_at_freeze = disk.mono_at_freeze
+                state.boot_at_freeze = disk.boot_at_freeze
         try:
             configmod.atomic_write_text(
                 self.path, json.dumps(state.as_dict(), indent=2, ensure_ascii=False)
@@ -699,10 +825,13 @@ class ResolveLedger:
         left = state.frozen_until - now
         if state.frozen_until_mono:
             mono_now = time.monotonic()
-            if mono_now >= state.mono_at_freeze:
+            if same_boot(state.boot_at_freeze, state.mono_at_freeze, mono_now):
                 # Same boot: the monotonic deadline is authoritative and no clock
-                # change can move it. After a reboot the counter restarts, which
-                # is exactly the case this comparison excludes.
+                # change can move it. After a reboot the counter restarts and its
+                # readings mean something else, which is what `same_boot` excludes
+                # -- `mono_now >= state.mono_at_freeze` did not: it comes true
+                # again the moment a rebooted machine outlives its previous
+                # uptime, and held a three-day-expired freeze open.
                 left = max(left, state.frozen_until_mono - mono_now)
         return left
 
@@ -732,10 +861,17 @@ class ResolveLedger:
             )
 
         gap = now - state.last_resolve_ts
-        if state.last_resolve_ts and gap < self.min_gap:
+        # `-self.min_gap <`, not a bare `<`: a stamp AHEAD of `now` -- a clock
+        # that ran fast when the resolve was recorded, a restored snapshot,
+        # another writer -- made `gap` negative and refused EVERY resolve until
+        # the clock caught up, while `summary()` reported no freeze at all, so
+        # nothing said why. `_recent` was given exactly this bound and the rule
+        # was not copied here. Inside one gap ahead still counts, which is the
+        # closed direction.
+        if state.last_resolve_ts and -self.min_gap < gap < self.min_gap:
             raise BudgetExhausted(
-                f"only {gap:.0f} s since the last resolve; the minimum gap is "
-                f"{self.min_gap:.0f} s."
+                f"only {max(0.0, gap):.0f} s since the last resolve; the minimum "
+                f"gap is {self.min_gap:.0f} s."
             )
 
     def _recent(self, state: LedgerState, now: float) -> list:
@@ -916,31 +1052,8 @@ class ResolveLedger:
 
     @staticmethod
     def _freeze_seconds(seconds) -> tuple[float, str]:
-        """How long to freeze for, and a note when that is not what was asked.
-
-        Never raises and never returns zero for a value it could not read: a
-        `freeze` call happens because Telegram has already said no, so refusing
-        to record it is the fail-open direction. See `MAX_FREEZE_SEC`.
-        """
-        try:
-            value = float(configmod.want_finite_number({"seconds": seconds}, "seconds"))
-        except ValueError:
-            return UNREADABLE_FREEZE_SEC, (
-                f"the wait was given as {seconds!r}, which is not a number of "
-                f"seconds; frozen for {UNREADABLE_FREEZE_SEC:.0f} s instead"
-            )
-        if value < 0:
-            return UNREADABLE_FREEZE_SEC, (
-                f"the wait was given as {value:.0f} s, which is not a wait; frozen "
-                f"for {UNREADABLE_FREEZE_SEC:.0f} s instead"
-            )
-        if value > MAX_FREEZE_SEC:
-            return MAX_FREEZE_SEC, (
-                f"the wait was given as {value:.0f} s, longer than this machine "
-                f"will freeze for; clamped to {MAX_FREEZE_SEC:.0f} s. A wait that "
-                "long is a clock, not a ban — `tg.py budget --unfreeze` lifts it"
-            )
-        return value, ""
+        """The module-level rule, under the name this class has always used."""
+        return freeze_seconds(seconds)
 
     def freeze(self, seconds: float, reason: str, now: float | None = None) -> LedgerState:
         """Telegram said wait. Record it; stop resolving for everything.
@@ -972,6 +1085,9 @@ class ResolveLedger:
                 if mono + seconds > state.frozen_until_mono:
                     state.frozen_until_mono = mono + seconds
                     state.mono_at_freeze = mono
+                    # Which boot the two numbers above belong to. Without it a
+                    # monotonic deadline survives every reboot.
+                    state.boot_at_freeze = time.time() - mono
 
         return self._mutate(change, when)
 
@@ -1005,6 +1121,7 @@ class ResolveLedger:
             state.frozen_until = 0.0
             state.frozen_until_mono = 0.0
             state.mono_at_freeze = 0.0
+            state.boot_at_freeze = 0.0
             state.frozen_reason = ""
 
         self._mutate(change, when, may_shorten=True)
@@ -1028,8 +1145,7 @@ class ResolveLedger:
             record["recorded"] = True
         return record
 
-    def check_join(self) -> None:
-        state = self.read()
+    def _check_join(self, state: LedgerState) -> None:
         if state.joins >= self.join_ceiling:
             raise BudgetExhausted(
                 f"{state.joins} joins already made today, ceiling is {self.join_ceiling}. "
@@ -1037,7 +1153,38 @@ class ResolveLedger:
                 "side effect of a search."
             )
 
+    def check_join(self) -> None:
+        self._check_join(self.read())
+
+    def reserve_join(self, now: float | None = None) -> LedgerState:
+        """Check the join ceiling and spend one, durably, BEFORE the call is made.
+
+        The resolve half of this ledger has counted before the call since the
+        review; joining still counted after it, from handlers that catch
+        `Exception` and `BaseException`. Those cover Ctrl+C and a supervisor's
+        timeout and cover nothing else: `SIGKILL`, a lost power supply and a
+        machine that panics leave no handler running at all, so three killed
+        processes joined three real groups with `joins_today: 0` on disk and the
+        ceiling of 3 untouched.
+
+        It also closes the gap between the check and the count. `check_join()`
+        read the file and `record_join()` wrote it one call later, so two
+        processes at the ceiling both read 2 and both joined. One guarded
+        read-modify-write, exactly as `reserve_resolve` does it.
+        """
+        def change(state: LedgerState) -> None:
+            self._check_join(state)
+            state.joins += 1
+
+        return self._mutate(change, _want_now(now))
+
     def record_join(self) -> LedgerState:
+        """Count a join that has already happened. `reserve_join` is the door.
+
+        Kept for a caller that joins outside this ledger's knowledge and wants
+        the count to be right afterwards; nothing in the skill uses it, because
+        counting after the wire is the direction a kill can lose.
+        """
         def change(state: LedgerState) -> None:
             state.joins += 1
 
@@ -1141,7 +1288,19 @@ class AccountLock:
     def __init__(self, path: Path, stale_after: float = 1800.0,
                  owner: str = "telegram-research"):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # The same rule as the ledger above and as `HistoryLog`: a state
+            # path that cannot exist is this module's own refusal, not a raw
+            # `OSError` out of a constructor. `AccountBusy` because that is what
+            # every caller already handles as "this run does not start", and
+            # because `acquire` answers a file-system refusal with it too.
+            raise AccountBusy(
+                f"the state directory {self.path.parent} could not be created: "
+                f"{exc}. Nothing was assumed about who owns the account; this "
+                "run does not start."
+            ) from None
         self.stale_after = stale_after
         self.owner = owner
         self._held = False
@@ -1260,16 +1419,34 @@ class AccountLock:
         last_alive = max(ts, mtime)
         return (now - last_alive) > self.stale_after
 
-    def _breaker(self, timeout: float = 2.0) -> configmod.FileGuard:
+    def _breaker(self, timeout=None) -> configmod.FileGuard:
         """The guard that serialises everything which may REPLACE this lock file.
 
         Named once here because `touch()` has to take the same one: any two
         operations that both end in a write to the lock path must exclude each
         other, or the older one lands after the newer.
+
+        **The wait outlives the staleness threshold**, which it did not: two
+        seconds of waiting against thirty seconds of "this guard is dead" meant
+        a process killed while breaking a lock made every later break give up
+        one turn short of being allowed to clear it -- for half a minute, and
+        with the account lock itself unbreakable for the whole of it. Both
+        numbers are `config`'s, so this file cannot drift from the rule again.
+        `touch` and `release` pass a deliberately short wait instead: they are
+        a heartbeat and a cleanup, and the right thing for them to do about a
+        guard somebody else holds is nothing.
+
+        Both numbers are read when the guard is BUILT rather than bound as
+        defaults when this function is defined, so a caller that lowers them --
+        the suite does, to keep three lock-contention tests from waiting out a
+        real timeout -- lowers the pair together and cannot leave the wait
+        shorter than the threshold by accident.
         """
         return configmod.FileGuard(
             self.path.with_name(self.path.name + ".break"),
-            timeout=timeout, stale_after=30.0, label="account-lock break",
+            timeout=configmod.GUARD_TIMEOUT if timeout is None else timeout,
+            stale_after=configmod.GUARD_STALE_AFTER,
+            label="account-lock break",
         )
 
     def _break_and_take(self, info: dict) -> bool:
@@ -1378,12 +1555,34 @@ class AccountLock:
             breaker.release()
 
     def release(self) -> None:
+        """Remove the lock file, but only while it is still ours to remove.
+
+        Inside the same `.break` guard `touch` and `_break_and_take` hold, and
+        for the same measured reason: `owns_the_file()` READS and the unlink
+        follows it. A lock legitimately broken between those two statements --
+        the holder had gone quiet long enough to look stale -- was deleted by its
+        PREVIOUS owner on the way out, and the new holder then ran with no lock
+        file at all, so a third process took the account alongside it. The
+        ownership check is re-read inside the guard, exactly as `touch` does it.
+
+        A guard held by somebody else means somebody is already replacing this
+        lock. The file on disk is then about to stop being ours whatever we do,
+        and deleting it would delete theirs, so the unlink is skipped -- but this
+        instance still stops claiming to hold anything.
+        """
         if not self._held:
             return
+        breaker = self._breaker(timeout=0.5)
         try:
-            if self.owns_the_file():
+            breaker.acquire()
+        except configmod.GuardBusy:
+            breaker = None
+        try:
+            if breaker is not None and self.owns_the_file():
                 self.path.unlink(missing_ok=True)
         finally:
+            if breaker is not None:
+                breaker.release()
             self._held = False
             self._token = {}
             if self in _HELD_LOCKS:

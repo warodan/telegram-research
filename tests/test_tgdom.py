@@ -171,3 +171,52 @@ def test_find_all_never_returns_the_node_it_was_called_on():
     # and `walk` still yields self first -- the two are deliberately different,
     # because `_fill_from` builds its exclusion set out of `walk`.
     assert next(iter(outer.walk())) is outer
+
+
+# --------------------------------------------------------------------------
+# Depth is a property of the body, and the body came off the network
+# --------------------------------------------------------------------------
+def _nested(depth: int, inner: str = "deep") -> str:
+    return "<div>" * depth + inner + "</div>" * depth
+
+
+def test_a_deeply_nested_document_does_not_blow_the_stack():
+    """`walk` and `_text_into` were recursive, one frame per level of nesting.
+
+    A 1 500-deep document therefore raised `RecursionError` out of
+    `tgparse.parse_preview` -- a public entry point, on a body from the network.
+    Telegram's markup is shallow; nothing here may depend on a remote server
+    keeping it that way, and a page this module cannot read has to be reported
+    rather than end the run with a traceback.
+    """
+    root = tgdom.parse(_nested(1500))
+    assert len(list(root.walk())) == 1501            # the document node plus 1500
+    assert root.text() == "deep"
+    assert len(root.find_all(tag="div")) == 1500
+
+
+def test_depth_does_not_change_what_the_text_comes_out_as():
+    # The rewrite is a change of mechanism, not of meaning: block tags still
+    # break the line on both sides, and `<br>` still becomes one newline.
+    html = ('<div class="msg">a<div>b<blockquote>c<br>d</blockquote>e</div>f'
+            "</div>")
+    node = tgdom.parse(html).find(cls="msg")
+    assert node.text() == "a\nb\nc\nd\ne\nf"
+
+
+def test_script_and_style_are_not_words_the_page_said():
+    """`<script>` content is a text node like any other, and `text()` took it.
+
+    A post carrying a widget script quoted the script; `_class_text` on a
+    landing card welded the card's prose to a var declaration. The DOM keeps
+    both -- an attribute lookup still works -- but neither is anything the page
+    says.
+    """
+    html = ('<div class="msg">before'
+            '<script>var x = "not text";</script>'
+            "<style>.a{color:red}</style>"
+            "after</div>")
+    node = tgdom.parse(html).find(cls="msg")
+    assert node.text() == "beforeafter"
+    # and the elements are still in the tree, with their attributes
+    assert [n.tag for n in node.find_all(tag="script")] == ["script"]

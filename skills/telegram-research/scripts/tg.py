@@ -357,28 +357,44 @@ def harvest_partial(run: Run | None, exc) -> int:
     return len(messages)
 
 
-def positive_int_flag(flag: str, why: str):
-    """An argparse `type=` that refuses 0 and negatives, with a reason.
+def _host_of(exc, web) -> str:
+    """Which host stopped, for a `RunAborted` that came out of `web`.
 
-    A budget flag that accepts 0 or -5 fails OPEN, which is the wrong direction
+    `TelegramWeb` records it as `aborted_host`; the empty string when a client
+    was handed over without one is read as t.me, because the strict reading is
+    the safe one -- a stop of unknown origin ends the command.
+    """
+    host = getattr(web, "aborted_host", None) or "t.me"
+    return host[4:] if host.startswith("www.") else host
+
+
+def budget_flag(value, flag: str = "--max-requests") -> int:
+    """A request budget, refused when it would fail OPEN rather than shut.
+
+    A budget flag that accepts 0 or -5 fails open, which is the wrong direction
     on the only brakes this skill has. `--max-requests 0` was dropped as falsy
     and the brief's 133/400/800 applied instead, to an operator who had typed 0
     meaning "spend nothing"; `--max-requests -5` was truthy, so the wrapper was
     reached and returned immediately on `ceiling <= 0` -- **the run-level brake
-    was removed altogether**, silently. `--count` right next door has always
-    refused 0 with a sentence; so do these now, at exit 2, before any request.
-    """
-    def parse(text: str) -> int:
-        try:
-            value = int(text)
-        except (TypeError, ValueError):
-            raise argparse.ArgumentTypeError(f"{flag} {text!r} is not a whole number")
-        if value <= 0:
-            raise argparse.ArgumentTypeError(f"{flag} {value} is not a budget. {why}")
-        return value
+    was removed altogether**, silently.
 
-    parse.__name__ = f"positive_int{flag.replace('-', '_')}"
-    return parse
+    Not argparse's `type=`, deliberately, for the reason `row_limit` states
+    above: argparse exits 2 with **zero bytes on stdout**, and the module
+    promises that every subcommand prints JSON. A subagent reading an empty
+    line cannot tell a refused flag from a command that found nothing, and
+    this is the flag most likely to be typed wrong.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise UsageError(f"{flag} {value!r} is not a whole number")
+    if number <= 0:
+        raise UsageError(
+            f"{flag} {number} is not a budget: a run cannot be given zero "
+            "requests to spend, and a negative number is not a ceiling at all. "
+            "Pass a positive number, or leave the flag off to use the brief's."
+        )
+    return number
 
 
 def row_limit(value, flag: str) -> int:
@@ -403,20 +419,12 @@ def row_limit(value, flag: str) -> int:
         raise UsageError(f"{flag} {value!r} is not a whole number")
     if number <= 0:
         raise UsageError(
-            f"{flag} {number} is not a number of rows. Python slices a negative "
-            "bound as 'all but the last N', so this used to drop rows while "
-            "`count` still reported the true total — the output looked "
-            "complete and was not. Pass a positive number."
+            f"{flag} {number} is not a number of rows. Python reads a negative "
+            "bound as 'all but the last N', which would silently drop rows while "
+            "`count` still reported the true total. Pass a positive number."
         )
     return number
 
-
-positive_int = positive_int_flag(
-    "--max-requests",
-    "0 used to be dropped as falsy so the brief's ceiling applied anyway, and a "
-    "negative value removed the run-level brake entirely instead of lowering it. "
-    "Pass a positive number, or leave the flag off to use the brief's.",
-)
 
 def request_ceiling(cfg, run: Run | None, args) -> int:
     """How many requests this command may spend, and where the number came from.
@@ -611,8 +619,8 @@ def build_web(cfg, run=None, *, args=None, ceiling: int | None = None):
         # and the old code answered that by running with NO ceiling at all.
         raise UsageError(
             f"a request ceiling of {ceiling} would let this command spend "
-            "nothing, and the way that used to be handled was to remove the "
-            "brake instead. Fix max_requests in the brief or the config."
+            "nothing at all, and it is refused rather than treated as no "
+            "ceiling. Fix max_requests in the brief or the config."
         )
     if ceiling:
         _apply_request_ceiling(
@@ -970,6 +978,18 @@ def cmd_discover(args, cfg) -> int:
                 f"--snippets-to {snippets_to}: its folder {snippets_to.parent} "
                 "does not exist"
             )
+        # Refused rather than overwritten, the way `report` refuses a
+        # `report.md` that already exists. This wrote over whatever was at the
+        # path with no question asked and no backup, and the obvious way to
+        # use the flag -- the same file for a second discovery pass -- lost
+        # the first pass's snippets.
+        if snippets_to.exists():
+            raise UsageError(
+                f"--snippets-to {snippets_to} already exists "
+                f"({snippets_to.stat().st_size} bytes) and this would replace "
+                "it. Nothing was written and no request was spent. Point the "
+                "flag at a new file, or move that one aside."
+            )
 
     active_run = open_run(args)
     web = None
@@ -991,10 +1011,18 @@ def cmd_discover(args, cfg) -> int:
                 resp = web.fetch(url, follow=True,
                                  save_as=f"lyzem-{kind}-{args.lyzem_query}.html")
             except tgweb.RunAborted as exc:
-                # The 429 that used to leave this command as a traceback with
-                # exit 1, while the identical signal one phase later produced
-                # JSON and exit 3. The candidates from the modes that DID answer
-                # are kept: they were paid for.
+                # A stop is about the surface that sent it. lyzem is a third
+                # party and a convenience: when IT stops, the remaining lyzem
+                # modes are on the same host and pointless, but the account
+                # channel below and the candidates already paid for are not.
+                # A stop from t.me still ends the command -- that one is the
+                # surface everything else depends on.
+                if _host_of(exc, web) != "t.me":
+                    lyzem_notes.append(
+                        f"lyzem stopped answering and the remaining modes were "
+                        f"skipped: {exc}"
+                    )
+                    break
                 _stop_run(str(exc))
                 emit({"ok": False, "stopped": str(exc),
                       "candidates": [c.__dict__ for c in result.ranked()],
@@ -1123,16 +1151,20 @@ def _open_account(cfg):
     """
     if not account_module.live_enabled_in_env():
         raise UsageError(
-            "searching a group goes through the account (messages.search), and "
-            "live mode is off. Set TELEGRAM_RESEARCH_ALLOW_LIVE=1 to allow it. "
-            "Nothing was sent and no credential was read."
+            "this command goes through the account, and live mode is off. Set "
+            "TELEGRAM_RESEARCH_ALLOW_LIVE=1 to allow it. Nothing was sent and "
+            "no credential was read."
         )
     cred = config_module.read_credentials(cfg)
     transport = account_module.TelethonTransport(
         cred["TELEGRAM_API_ID"], cred["TELEGRAM_API_HASH"], cred["TELEGRAM_SESSION"],
         allow_live=True,
     )
-    return transport.connect()
+    # Handed over UNCONNECTED. `AccountSession.__enter__` connects it after the
+    # account lock is held: a handshake here would authorise a second connection
+    # on the same identity, and spend its two calls, before finding out that
+    # another process owns the account.
+    return transport
 
 
 def _group_peer(session, username: str) -> tuple[dict | None, str | None]:
@@ -1170,7 +1202,7 @@ def _group_peer(session, username: str) -> tuple[dict | None, str | None]:
 def _search_group(args, cfg, active_run) -> int:
     """`messages.search` inside one public group. The reason the account exists.
 
-    Measured 2026-08-25 on `hanoi_chats`: 1 call for the peer, 1 call for the
+    Measured 2026-08-25 on `birding_chats`: 1 call for the peer, 1 call for the
     query, 44 hits spanning 2023-04 to 2026-03, 0 resolves, no wait. What this
     replaced was 200 accountless GETs that returned 2 messages, neither of them
     carrying the word the run was about.
@@ -1519,6 +1551,20 @@ def cmd_search(args, cfg) -> int:
 
 def cmd_history(args, cfg) -> int:
     args.username = check_username(args.username)
+    # Before the run is opened and long before a request is spent, the way
+    # `--id` and `--max-pages` are. Both of these went into the URL exactly as
+    # typed: `--before -5` reached `t.me`, came back with nothing, and cost a
+    # paid GET to say so.
+    if args.before is not None and args.before < 1:
+        raise UsageError(
+            f"--before {args.before} is not a message id. It is the cursor the "
+            "walk starts above, and message ids start at 1."
+        )
+    if args.until_id is not None and args.until_id < 0:
+        raise UsageError(
+            f"--until-id {args.until_id} is not a message id. It is the floor "
+            "the walk stops at, and message ids start at 1 (0 means no floor)."
+        )
     active_run = open_run(args)
     reg = get_registry(cfg)
     known = reg.get(args.username) or {}
@@ -1618,7 +1664,7 @@ def cmd_group(args, cfg) -> int:
     This is the whole accountless group surface, and it is deliberately not a
     search. Until 2026-08-25 it also carried the machinery that GUESSED which
     ids to ask for -- a head estimator, a catch-up creep, a blind scan, a miss
-    tolerance derived from observed density. Measured on `hanoi_chats` that
+    tolerance derived from observed density. Measured on `birding_chats` that
     machinery spent 200 requests, returned 2 messages, and matched the word the
     run was about **zero** times; about 1 % of a group's id range answers at
     all, so finding ten messages carrying one word would have cost ~199 000
@@ -1647,7 +1693,7 @@ def cmd_group(args, cfg) -> int:
                      "a page. Use `search` or `history`.",
         })
         return EXIT_WRONG_ROUTE
-    found, missing, mismatched = [], [], []
+    found, missing, mismatched, unreadable = [], [], [], []
     try:
         for message_id in ids:
             msg, verdict = read_module._fetch_group_message(
@@ -1658,6 +1704,12 @@ def cmd_group(args, cfg) -> int:
                 found.append(msg)
             elif verdict == "wrong_post":
                 mismatched.append(message_id)
+            elif verdict == "unreadable":
+                # The page came back and this reader could not make a message
+                # out of it -- a login wall, or a front end that moved. Kept
+                # apart from `missing` because only `missing` is evidence that
+                # the id holds nothing.
+                unreadable.append(message_id)
             else:
                 missing.append(message_id)
     except tgweb.RunAborted as exc:
@@ -1668,6 +1720,7 @@ def cmd_group(args, cfg) -> int:
         _stop_run(str(exc))
         emit({"ok": False, "stopped": str(exc), "username": args.username,
               "ids_asked": ids, "found": len(found),
+              "unreadable_ids": unreadable,
               "messages": [m.as_dict() for m in found]})
         return EXIT_STOPPED
     suppressed = active_run.write_posts(found).suppressed if active_run else 0
@@ -1678,10 +1731,14 @@ def cmd_group(args, cfg) -> int:
         "found": len(found),
         # An id that answered nothing is not a group that said nothing: a gap in
         # a group's ids is ordinary (124 empty ids in a row sat between two live
-        # messages on `hanoi_chats`), and `?embed=1` renders some message types
+        # messages on `birding_chats`), and `?embed=1` renders some message types
         # not at all. Named separately from `mismatched_ids`, which is a page
         # that came back for another id or another peer.
         "missing_ids": missing,
+        # An id whose page could not be read at all. It is NOT an empty id: a
+        # run that treats it as one reports a talking group as a finished
+        # history. A non-empty list here is a reason to run `selftest`.
+        "unreadable_ids": unreadable,
         "mismatched_ids": mismatched,
         "requests": web.request_count,
         "posts_suppressed_as_duplicates": suppressed,
@@ -2142,21 +2199,34 @@ def _unfreeze(ledger, args, cfg) -> int:
     the value it cleared and why. Nothing is decided here: this command supplies
     the reason and prints what came back.
     """
-    before = ledger.summary()
+    log = account_module.HistoryLog(
+        Path(cfg.state_dir) / account_module.HISTORY_STATE_FILE
+    )
+    before, history_before = ledger.summary(), log.summary()
     reason = (args.reason or "").strip() or (
         f"cleared with `tg.py budget --unfreeze` at {now_local()}"
     )
     record = ledger.clear_freeze(reason)
-    after = ledger.summary()
+    # Both freezes, in one command. They are earned by different calls but they
+    # stop the same three subcommands, and a flag that lifted only the resolve
+    # one left the operator with a frozen skill and nothing left to press.
+    history_record = log.clear_freeze(reason)
+    after, history_after = ledger.summary(), log.summary()
     emit({
         "ok": True,
-        "was_frozen": bool(before.get("frozen")),
+        "was_frozen": bool(before.get("frozen"))
+                      or bool(history_before.get("history_frozen")),
         "frozen_for_sec_before": before.get("frozen_for_sec"),
         "frozen_reason_before": before.get("frozen_reason"),
+        "history_frozen_for_sec_before": history_before.get("history_frozen_for_sec"),
+        "history_frozen_reason_before": history_before.get("history_frozen_reason"),
         "cleared": record,
+        "cleared_history": history_record,
         "reason": reason,
-        "frozen": bool(after.get("frozen")),
+        "frozen": bool(after.get("frozen"))
+                  or bool(history_after.get("history_frozen")),
         "ledger": after,
+        "history": history_after,
         "path": str(cfg.ledger_path),
         "next": "the freeze is Telegram's own signal: clearing one it still "
                 "means earns the next one longer. Resolve slowly.",
@@ -2188,9 +2258,26 @@ def cmd_budget(args, cfg) -> int:
     # verdict was there all along, two levels down in `ledger.summary()`, where
     # an agent branching on the top-level flag never looked.
     readable = bool(summary.get("readable", True))
+    # The history log is the OTHER freeze, and the one a CLI run can actually
+    # earn: `resolveUsername` is off every ordinary path, while `getHistory`,
+    # `contacts.search` and `messages.search` all go through it. Reporting only
+    # the resolve ledger answered "frozen: false" while every account command
+    # refused -- from the command SKILL.md calls the safety check.
+    try:
+        history = account_module.HistoryLog(
+            Path(cfg.state_dir) / account_module.HISTORY_STATE_FILE
+        ).summary()
+    except account_module.StateUnreadable as exc:
+        # Caught rather than raised, for the same reason the ledger's own
+        # unreadable verdict is a field and not an exception: this is the
+        # command SKILL.md calls always safe to ask, and it has to answer
+        # even when the file it wanted to read is damaged.
+        history = {"readable": False, "error": str(exc)}
+        readable = False
     emit({"ok": readable, "readable": readable,
-          "frozen": bool(summary.get("frozen", False)),
-          "ledger": summary, "path": str(cfg.ledger_path),
+          "frozen": bool(summary.get("frozen", False))
+                    or bool(history.get("history_frozen", False)),
+          "ledger": summary, "history": history, "path": str(cfg.ledger_path),
           "error": None if readable else
           f"{cfg.ledger_path} cannot be read, so nothing may be resolved. "
           "Repair it or move it aside; a ledger that cannot be read is a "
@@ -2334,7 +2421,13 @@ def cmd_report(args, cfg) -> int:
         run, discovery=None, query_log=query_log, sources_used=sources, posts=posts,
         query_log_error=query_log_error, lang=lang,
     )
-    (root / "report.md").write_text(config_module.redact(text), encoding="utf-8")
+    # Guarded and atomic, like `run.json` and `queries.json`. A bare
+    # `write_text` truncates before it writes, so an interrupt here left the
+    # gate's own artefact half-written -- on the one file a human writes by
+    # hand and the only copy of which is this one.
+    report_path = root / "report.md"
+    with config_module.file_guard(report_path, label="report.md"):
+        config_module.atomic_write_text(report_path, config_module.redact(text))
     run.finish()
     emit({"ok": True, "report": str(root / "report.md"),
           "overwrote_existing": bool(args.force),
@@ -2402,6 +2495,22 @@ def cmd_selftest(args, cfg) -> int:
             "reads ship with the skill at tests/fixtures/probes; point --probes "
             "at a copy of them, or at the full corpus in the project repository"
         )
+    def probe_page(name: str) -> str:
+        """One probe, or a sentence naming the file that is missing.
+
+        A corpus short one page used to come back as a bare FileNotFoundError:
+        exit 7 with a traceback, from the command whose whole job is to give a
+        clear verdict about the parsers.
+        """
+        path = probes / name
+        if not path.is_file():
+            raise UsageError(
+                f"{path} is missing. This command reads 10 named pages, and a "
+                "corpus short one of them cannot answer whether the parsers "
+                "still agree with Telegram. Point --probes at a complete copy."
+            )
+        return path.read_text(encoding="utf-8", errors="replace")
+
     checks, failures = [], []
 
     def check(name, got, want):
@@ -2410,20 +2519,20 @@ def cmd_selftest(args, cfg) -> int:
         if not ok:
             failures.append(name)
 
-    body = (probes / "C01-landing-durov.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("C01-landing-durov.html")
     card = tgparse.parse_landing(body, "durov")
     check("durov.type", card.type, "channel")
     check("durov.members", card.members, 11110268)
 
-    body = (probes / "A18-landing-tdlibchat.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("A18-landing-tdlibchat.html")
     card = tgparse.parse_landing(body, "tdlibchat")
     check("tdlibchat.type", card.type, "group")
     check("tdlibchat.online", card.online, 362)
 
-    body = (probes / "C02-landing-nonexistent.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("C02-landing-nonexistent.html")
     check("nonexistent.exists", tgparse.parse_landing(body, "zzqwx").exists, False)
 
-    body = (probes / "A01-s-durov.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("A01-s-durov.html")
     page = tgparse.parse_preview(body, "durov")
     # The id count, not the block count. An album is ONE `data-post` block
     # carrying several ids -- measured live on `t.me/s/nexta_tv`, 18 blocks over
@@ -2448,7 +2557,7 @@ def cmd_selftest(args, cfg) -> int:
           sum(1 for m in page.messages if (m.text or "").strip()), 20)
     check("durov.page_before", page.before, 523)
 
-    body = (probes / "A09-s-Astana_motoriders.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("A09-s-Astana_motoriders.html")
     page = tgparse.parse_preview(body, "Astana_motoriders")
     check("service_messages_counted",
           sum(1 for m in page.messages if m.is_service), 1)
@@ -2456,30 +2565,30 @@ def cmd_selftest(args, cfg) -> int:
           "unsupported:video" in {kind for m in page.messages for kind in (m.media or [])},
           True)
 
-    body = (probes / "C15-s-durov-q-rare.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("C15-s-durov-q-rare.html")
     page = tgparse.parse_preview(body, "durov", found_by="bitcoin")
     check("q_bitcoin.ids", [m.id for m in page.messages], [62, 67, 77, 116, 215, 232, 440])
     # A terminal search page publishes no cursor. If this ever becomes an id,
     # every search starts paying one request past its last page of hits again.
     check("q_bitcoin.no_cursor", page.before, None)
 
-    body = (probes / "C26-embed-hanoi-29320.html").read_text(encoding="utf-8", errors="replace")
-    check("missing_post", tgparse.parse_embed(body, "hanoi_chats", 29320), None)
+    body = probe_page("C26-embed-birding-29320.html")
+    check("missing_post", tgparse.parse_embed(body, "birding_chats", 29320), None)
 
-    body = (probes / "C08-embed-tdlibchat-50000.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("C08-embed-tdlibchat-50000.html")
     check("ghost_post.detected", tgweb.post_missing(body), True)
     check("ghost_post.not_a_message", tgparse.parse_embed(body, "tdlibchat", 50000), None)
 
-    body = (probes / "C10-embed-tdlibchat-10000.html").read_text(encoding="utf-8", errors="replace")
+    body = probe_page("C10-embed-tdlibchat-10000.html")
     msg = tgparse.parse_embed(body, "tdlibchat", 10000)
     check("group_author_username", msg.author_username, "redacted_user_01")
     check("reply_not_leaking", msg.text.startswith("If you set permissions"), True)
     check("reply_quote_kept", bool((msg.reply_to_text or "").strip()), True)
     check("reply_quote_out_of_text", (msg.reply_to_text or "!") in (msg.text or ""), False)
 
-    body = (probes / "C16-embed-hanoi-1000.html").read_text(encoding="utf-8", errors="replace")
-    msg = tgparse.parse_embed(body, "hanoi_chats", 1000)
-    check("group_chat_peer", msg.chat_peer, "c1931920118_4774030320557415984")
+    body = probe_page("C16-embed-birding-1000.html")
+    msg = tgparse.parse_embed(body, "birding_chats", 1000)
+    check("group_chat_peer", msg.chat_peer, "c1000000001_4000000000000000001")
 
     emit({"ok": not failures, "checks": checks, "failed": failures,
           "probes": str(probes),
@@ -2512,14 +2621,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=None,
                         help="the project directory run folders are created "
                              "under, in <root>/telegram-runs/. The default is "
-                             "the project this skill is installed in — NOT the "
-                             "current directory, which used to decide it and "
-                             "made where a run landed depend on which shell "
-                             "started it")
+                             "the project this skill is installed in, NOT the "
+                             "current directory")
     parser.add_argument("--run", dest="run_dir",
                         help="a run folder: originals go to <run>/notes/sources and "
                              "every request is logged to <run>/fetchlog.jsonl")
-    parser.add_argument("--max-requests", type=positive_int, default=None,
+    parser.add_argument("--max-requests", default=None,
                         help="raise or lower this command's request ceiling; the "
                              "default is the run brief's, then config's "
                              "max_requests_per_run")
@@ -2531,7 +2638,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--probe-preview", action="store_true")
     p.add_argument("--found-via", default="manual",
                    choices=list(registry_module.VALID_FOUND_VIA))
-    p.add_argument("--lang"), p.add_argument("--geo")
+    p.add_argument("--lang")
+    p.add_argument("--geo")
     p.add_argument("--min-channel-members", type=int, default=100)
     p.add_argument("--min-group-members", type=int, default=50)
     p.add_argument("--save-to", help="a SECOND place to copy the originals; the "
@@ -2605,22 +2713,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query", action="append", default=[])
     p.add_argument("--posts", help="a posts.jsonl to mine instead of the run's own")
     p.add_argument("--top", type=int, default=25)
-    p.add_argument("--term"), p.add_argument("--gloss")
+    p.add_argument("--term")
+    p.add_argument("--gloss")
     p.set_defaults(func=cmd_queries)
 
     p = sub.add_parser("note", help="write notes/<agent>.md into a run")
     p.add_argument("run")
     p.add_argument("--agent", default="telegram")
-    p.add_argument("--text"), p.add_argument("--from-file")
+    p.add_argument("--text")
+    p.add_argument("--from-file")
     p.set_defaults(func=cmd_note)
 
     p = sub.add_parser("accept", help="write acceptance.json and the gate verdict")
     p.add_argument("run")
     p.set_defaults(func=cmd_accept)
 
-    p = sub.add_parser("registry")
+    p = sub.add_parser("registry",
+                       help="the source registry: stats, list, get, compact")
     p.add_argument("action", choices=["stats", "list", "get", "compact"])
-    p.add_argument("--username"), p.add_argument("--topic"), p.add_argument("--type")
+    p.add_argument("--username")
+    p.add_argument("--topic")
+    p.add_argument("--type")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--force", action="store_true",
                    help="compact a registry that holds unreadable lines anyway; "
@@ -2629,23 +2742,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "rebuilds the file from the lines that DO parse")
     p.set_defaults(func=cmd_registry)
 
-    p = sub.add_parser("budget", help="resolve ledger: spent, ceiling, frozen?")
+    p = sub.add_parser("budget", help="what the account spent today, and "
+                                      "whether either freeze is on")
     p.add_argument("--unfreeze", action="store_true",
-                   help="lift the resolve freeze. The cleared value and the "
-                        "reason are recorded in the ledger; without this the "
-                        "only way back was editing the JSON by hand")
+                   help="lift both freezes -- the resolve ledger's and the "
+                        "history log's. The cleared value and the reason are "
+                        "recorded in each journal")
     p.add_argument("--reason", help="why the freeze is being lifted; recorded "
                                     "in the ledger beside the cleared value")
     p.set_defaults(func=cmd_budget)
 
     p = sub.add_parser("newrun", help="create the run folder and its brief")
-    p.add_argument("--brief"), p.add_argument("--question")
+    p.add_argument("--brief")
+    p.add_argument("--question")
     p.add_argument("--topic", default="general",
                    help="a subject label for the brief and the registry. It is "
                         "not part of the run folder's path")
     p.add_argument("--depth", default="normal", choices=["quick", "normal", "deep"])
-    p.add_argument("--lang"), p.add_argument("--geo")
-    p.add_argument("--since"), p.add_argument("--until")
+    p.add_argument("--lang")
+    p.add_argument("--geo")
+    p.add_argument("--since")
+    p.add_argument("--until")
     p.add_argument("--seed-source", action="append")
     p.add_argument("--seed-query", action="append")
     p.add_argument("--max-rounds", type=int, default=None)
@@ -2656,7 +2773,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_newrun)
 
     p = sub.add_parser("report", help="write the report skeleton")
-    p.add_argument("run"), p.add_argument("--question")
+    p.add_argument("run")
+    p.add_argument("--question")
     p.add_argument("--report-lang", default=run_module.DEFAULT_REPORT_LANG,
                    choices=list(run_module.REPORT_LANGS),
                    help="the language the report skeleton is written in "
@@ -2688,6 +2806,10 @@ def dispatch(args) -> int:
     nothing to say".
     """
     try:
+        # Checked here rather than by `argparse`, so a refused budget is JSON
+        # and not an empty stdout. See `budget_flag`.
+        if getattr(args, "max_requests", None) is not None:
+            args.max_requests = budget_flag(args.max_requests)
         # `config.load()` used to sit outside this block, so the one error class
         # the program formats as JSON was the one error that always tracebacked.
         cfg = config_module.load(root_arg(args))
@@ -2730,6 +2852,15 @@ def dispatch(args) -> int:
     except read_module.WrongRoute as exc:
         emit({"ok": False, "error": str(exc), "error_type": "WrongRoute"})
         return EXIT_WRONG_ROUTE
+    except account_module.StateUnreadable as exc:
+        # Above `AccountError`, which it inherits from: a damaged
+        # `account-history.json` is a file on this disk, the same kind of fact
+        # as a damaged ledger, and the `AccountError` clause below answers 5 --
+        # "the surface answered badly" -- about something the network never
+        # touched. `budget` is the command that hits this, and it is the one
+        # SKILL.md calls always safe to ask.
+        emit({"ok": False, "error": str(exc), "error_type": "StateUnreadable"})
+        return EXIT_INTERNAL
     except account_module.AccountError as exc:
         # Every one of these is a condition the module raises deliberately, and
         # without this clause they all landed on exit 9 -- "this is a bug in

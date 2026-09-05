@@ -78,7 +78,6 @@ __all__ = [
     "AccountError",
     "AccountSession",
     "EvidenceRequired",
-    "FakeTransport",
     "FloodWait",
     "HistoryLog",
     "HistoryPage",
@@ -1024,134 +1023,6 @@ def _message_record(msg, senders: dict | None = None) -> dict:
     }
 
 
-class FakeTransport(Transport):
-    """In-memory transport. Every safety rule in this module is proved through it.
-
-    Scriptable three ways, which is exactly what the rules need: answer with a
-    peer, raise a FloodWait of N seconds, raise not-found. It records every call
-    it receives, so a test can assert on what was NOT sent, which is the more
-    important half here.
-    """
-
-    def __init__(self, peers: dict | None = None):
-        self.peers: dict[str, dict] = dict(peers or {})
-        self.floods: dict[str, int] = {}          # username, "*" for any, "history",
-        #                                           "contacts.search", "messages.search"
-        self.missing: set[str] = set()
-        self.pages: dict[int, list] = {}          # peer id -> message records
-        self.contacts: dict[str, list] = {}       # query -> peer records
-        self.hits: dict[tuple, dict] = {}         # (peer id, query) -> {messages, total}
-        self.stale: set = set()                   # access hashes Telegram refuses
-        self.resolve_calls: list[dict] = []
-        self.history_calls: list[dict] = []
-        self.contacts_calls: list[dict] = []
-        self.search_calls: list[dict] = []
-        self.join_calls: list[dict] = []
-        self.closed = False
-
-    # -- scripting ---------------------------------------------------------
-    def answer_with(self, username: str, peer_id: int, access_hash: int = 1234567890):
-        self.peers[username] = {"id": int(peer_id), "access_hash": int(access_hash)}
-        return self
-
-    def flood_on(self, username: str, seconds: int = 36468):
-        self.floods[username] = int(seconds)
-        return self
-
-    def not_found(self, username: str):
-        self.missing.add(username)
-        return self
-
-    def with_history(self, peer_id: int, messages: list):
-        self.pages[int(peer_id)] = list(messages)
-        return self
-
-    def with_contacts(self, query: str, rows: list):
-        self.contacts[query] = list(rows)
-        return self
-
-    def with_hits(self, peer_id: int, query: str, messages: list, total: int | None = None):
-        self.hits[(int(peer_id), query)] = {
-            "messages": list(messages),
-            "total": len(messages) if total is None else int(total),
-        }
-        return self
-
-    def stale_peer(self, access_hash: int):
-        """Script the one failure a permanent peer cache can cause.
-
-        Keyed on the HASH, not the peer: a fake that refuses the whole peer
-        cannot show the repair working.
-        """
-        self.stale.add(int(access_hash))
-        return self
-
-    # -- the two operations ------------------------------------------------
-    def resolve_username(self, username: str, *, options: dict | None = None) -> dict:
-        options = _assert_free(options)
-        self.resolve_calls.append({"username": username, "options": options})
-        seconds = self.floods.get(username, self.floods.get("*"))
-        if seconds:
-            raise FloodWait(seconds, f"contacts.resolveUsername @{username}")
-        if username in self.missing or username not in self.peers:
-            raise PeerNotFound(f"@{username} does not resolve")
-        return dict(self.peers[username])
-
-    def fetch_history(self, peer: dict, *, limit: int = 100, offset_id: int = 0,
-                      options: dict | None = None) -> list[dict]:
-        options = _assert_free(options)
-        self.history_calls.append(
-            {"peer": dict(peer), "limit": limit, "offset_id": offset_id, "options": options}
-        )
-        seconds = self.floods.get("history")
-        if seconds:
-            raise FloodWait(seconds, "messages.getHistory")
-        rows = list(self.pages.get(int(peer.get("id", 0)), []))
-        if offset_id:
-            rows = [r for r in rows if int(r.get("id", 0)) < int(offset_id)]
-        return rows[:limit]
-
-    def search_contacts(self, query: str, *, limit: int = 50,
-                        options: dict | None = None) -> list[dict]:
-        options = _assert_free(options)
-        self.contacts_calls.append({"query": query, "limit": limit, "options": options})
-        seconds = self.floods.get("contacts.search")
-        if seconds:
-            raise FloodWait(seconds, "contacts.search")
-        return [dict(row) for row in self.contacts.get(query, [])][:limit]
-
-    def search_messages(self, peer: dict, query: str, *, limit: int = 50,
-                        add_offset: int = 0, options: dict | None = None) -> dict:
-        options = _assert_free(options)
-        self.search_calls.append({"peer": dict(peer), "query": query, "limit": limit,
-                                  "add_offset": add_offset, "options": options})
-        seconds = self.floods.get("messages.search")
-        if seconds:
-            raise FloodWait(seconds, "messages.search")
-        peer_id = int(peer.get("id", 0))
-        if int(peer.get("access_hash", 0)) in self.stale:
-            raise PeerUnusable(
-                "messages.search: Telegram refused this peer (ChannelInvalidError). "
-                "The cached access_hash is stale or the peer is not reachable "
-                "from this account; look the name up again with contacts.search."
-            )
-        found = self.hits.get((peer_id, query), {"messages": [], "total": 0})
-        rows = list(found["messages"])[add_offset:add_offset + limit]
-        return {"messages": rows, "total": int(found["total"])}
-
-    # -- lifecycle ---------------------------------------------------------
-    def close(self) -> None:
-        """The real transport has one, so the stand-in has one: a caller that
-        connects and then fails before the session opens must still close it."""
-        self.closed = True
-
-    # -- beyond the protocol -----------------------------------------------
-    def join_group(self, peer: dict, *, options: dict | None = None) -> dict:
-        options = _assert_free(options)
-        self.join_calls.append({"peer": dict(peer), "options": options})
-        return {"joined": True, "peer_id": int(peer.get("id", 0))}
-
-
 # --------------------------------------------------------------------------
 # History accounting
 # --------------------------------------------------------------------------
@@ -1181,7 +1052,7 @@ class HistoryLog:
     `PermissionError [WinError 5]` out of a module that promises its own types.
     """
 
-    def __init__(self, path, guard_timeout: float = 10.0):
+    def __init__(self, path, guard_timeout: float | None = None):
         self.path = Path(path)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1200,16 +1071,36 @@ class HistoryLog:
             ) from None
         self.guard_timeout = guard_timeout
 
+    def _timeout(self) -> float:
+        """The guard timeout, read at call time.
+
+        A default argument is bound at import while its partner
+        `GUARD_STALE_AFTER` is read at call time, so anything that moved both
+        would have moved only one and silently inverted `timeout > stale_after`
+        -- the invariant that lets a waiter outlive a dead writer's guard.
+        """
+        return (configmod.GUARD_TIMEOUT if self.guard_timeout is None
+                else self.guard_timeout)
+
     # -- state -------------------------------------------------------------
     @staticmethod
     def _fresh(now: float | None = None) -> dict:
         return {"date": _day_of(now), "requests": 0, "frozen_until": 0.0,
-                "frozen_reason": "", "frozen_until_mono": 0.0, "mono_at_freeze": 0.0}
+                "frozen_reason": "", "frozen_until_mono": 0.0, "mono_at_freeze": 0.0,
+                "boot_at_freeze": 0.0, "last_request_ts": 0.0}
 
     def _guard(self) -> configmod.FileGuard:
         return configmod.FileGuard(
             self.path.with_name(self.path.name + ".rmw"),
-            timeout=self.guard_timeout, stale_after=60.0, label="history state",
+            # The wait outlives the staleness threshold, which it did not:
+            # ten seconds of waiting against sixty seconds of "this guard is
+            # dead" meant a writer killed mid-write blocked the history state
+            # for a full minute while every attempt to use it gave up after
+            # ten -- one turn short of being allowed to clear it, and burning
+            # wall clock after the account calls had already been paid for.
+            # Both numbers come from `config`, where the rule lives.
+            timeout=self._timeout(), stale_after=configmod.GUARD_STALE_AFTER,
+            label="history state",
         )
 
     def _guard_or_refuse(self) -> configmod.FileGuard:
@@ -1273,6 +1164,13 @@ class HistoryLog:
                     configmod.want_finite_number(data, "frozen_until_mono", 0.0)),
                 "mono_at_freeze": float(
                     configmod.want_finite_number(data, "mono_at_freeze", 0.0)),
+                # Which boot `mono_at_freeze` belongs to, and when the last
+                # account call left this machine -- see `same_boot` and
+                # `AccountSession._pace_history`.
+                "boot_at_freeze": float(
+                    configmod.want_finite_number(data, "boot_at_freeze", 0.0)),
+                "last_request_ts": float(
+                    configmod.want_finite_number(data, "last_request_ts", 0.0)),
             }
         except (TypeError, ValueError) as exc:
             raise StateUnreadable(
@@ -1303,17 +1201,22 @@ class HistoryLog:
         finally:
             guard.release()
 
-    def _write_locked(self, state: dict) -> None:
+    def _write_locked(self, state: dict, *, may_shorten: bool = False) -> None:
         """Serialise the state. Called with the guard held.
 
         The freeze floor is enforced here rather than trusted to callers: both
         `freeze` and `record_request` are read-modify-write over the whole state,
         and a `record_request` that had read before a `freeze` landed used to
         write `frozen_until = 0.0` back over it -- measured, 36 467 s -> 0 s.
+
+        `may_shorten=True` is the ONE deliberate exception and belongs to
+        `clear_freeze` alone, exactly as it does in the resolve ledger.
         """
         try:
             disk = self.read()
         except StateUnreadable:
+            disk = None
+        if may_shorten:
             disk = None
         if disk is not None:
             if disk["frozen_until"] > state.get("frozen_until", 0.0):
@@ -1324,6 +1227,12 @@ class HistoryLog:
             if disk["frozen_until_mono"] > state.get("frozen_until_mono", 0.0):
                 state["frozen_until_mono"] = disk["frozen_until_mono"]
                 state["mono_at_freeze"] = disk["mono_at_freeze"]
+                state["boot_at_freeze"] = disk["boot_at_freeze"]
+            # The pacing stamp is the same shape of fact as the freeze: a stale
+            # copy of the state must never take it backwards, or two processes
+            # racing to record a call hand the next one a free pass.
+            if disk["last_request_ts"] > state.get("last_request_ts", 0.0):
+                state["last_request_ts"] = disk["last_request_ts"]
         try:
             configmod.atomic_write_text(
                 self.path, json.dumps(state, indent=2, ensure_ascii=False)
@@ -1337,13 +1246,14 @@ class HistoryLog:
         # the ledger, and the ledger write was the only heartbeat there was.
         resolvemod.touch_held_locks()
 
-    def _mutate(self, change, now: float | None = None) -> dict:
+    def _mutate(self, change, now: float | None = None, *,
+                may_shorten: bool = False) -> dict:
         """read -> change -> write, all inside one cross-process critical section."""
         guard = self._guard_or_refuse()
         try:
             state = self.read(now)
             change(state)
-            self._write_locked(state)
+            self._write_locked(state, may_shorten=may_shorten)
             return state
         finally:
             guard.release()
@@ -1362,32 +1272,45 @@ class HistoryLog:
         left = state["frozen_until"] - now
         if state["frozen_until_mono"]:
             mono_now = time.monotonic()
-            if mono_now >= state["mono_at_freeze"]:
+            if resolvemod.same_boot(state["boot_at_freeze"], state["mono_at_freeze"],
+                                    mono_now):
                 # Same boot: the monotonic deadline is authoritative. After a
-                # reboot the counter restarts, which is the case this excludes.
+                # reboot the counter restarts and its readings mean something
+                # else -- `mono_now >= mono_at_freeze` did not exclude that, it
+                # comes true again as soon as a rebooted machine outlives its
+                # previous uptime. `resolve.same_boot` is the one rule.
                 left = max(left, state["frozen_until_mono"] - mono_now)
         return max(0, int(left))
 
     def freeze(self, seconds: float, reason: str, now: float | None = None) -> dict:
+        """Telegram said wait on an account call. Record it, durably and bounded.
+
+        The bound and the direction of failure are the ledger's own rule, called
+        rather than copied (`resolve.freeze_seconds`), because this copy had
+        drifted from it in both directions at once:
+
+        * **No ceiling.** `frozen_until` is `max()`-monotone and `_write_locked`
+          refuses every write that would shorten it, so one bad number stopped
+          every account call in every process for as long as it said. Measured:
+          a freeze of a billion seconds went to disk verbatim -- 31 years, with
+          nothing in the skill able to lift it.
+        * **Fail open on a value it could not read.** A wait of `nan` raised
+          `StateWriteFailed` and wrote NOTHING, so the freeze Telegram had
+          already imposed was not on disk for the next process to see. The
+          ledger deliberately records a bounded wait instead and says in the
+          reason that it is not the number that was asked for. This does the
+          same, and this is the freeze the CLI can really earn.
+        """
         injected = now is not None
         when = time.time() if now is None else now
-        try:
-            seconds = float(configmod.want_finite_number({"seconds": seconds},
-                                                         "seconds"))
-        except ValueError as exc:
-            # A wait we cannot turn into a number is still Telegram saying stop.
-            # `float("nan")` used to land on disk, and NaN makes every
-            # comparison false: `frozen_for` would then read the freeze as over.
-            raise StateWriteFailed(
-                f"a freeze of {seconds!r} cannot be recorded ({exc}). Nothing was "
-                "written; treat the wait as unrecorded and stop rather than retry."
-            ) from None
+        seconds, note = resolvemod.freeze_seconds(seconds)
 
         def change(state: dict) -> None:
             state["frozen_until"] = max(state["frozen_until"], when + seconds)
             state["frozen_reason"] = (
                 f"{reason} (recorded "
                 f"{datetime.now(configmod.local_tz()).isoformat(timespec='seconds')})"
+                + (f" — {note}" if note else "")
             )
             if not injected:
                 # Only a real clock gets a monotonic twin. A test driving `now`
@@ -1397,18 +1320,82 @@ class HistoryLog:
                 if mono + seconds > state["frozen_until_mono"]:
                     state["frozen_until_mono"] = mono + seconds
                     state["mono_at_freeze"] = mono
+                    # Which boot those two belong to. Without it a monotonic
+                    # deadline outlives every reboot -- see `resolve.same_boot`.
+                    state["boot_at_freeze"] = time.time() - mono
 
         return self._mutate(change, now)
 
+    def clear_freeze(self, reason: str, now: float | None = None) -> dict:
+        """Lift a history freeze deliberately, recording what was lifted and why.
+
+        There was no way to do this at all: `frozen_until` only ever grows,
+        `_write_locked` refuses every write that would shorten it, and the only
+        freeze the CLI can really earn is this one -- so a wait written from a
+        wrong clock could be removed only by deleting the state file by hand,
+        which throws away the day's count of account calls with it.
+
+        Same shape and same promises as `ResolveLedger.clear_freeze`, including
+        the audit line: the lift happens FIRST and `<state>.freezes.jsonl`
+        follows on a best-effort basis, because a journal that cannot be written
+        must not un-lift a freeze the caller asked for. `recorded: False` in the
+        answer is what says the decision left no trace.
+        """
+        when = time.time() if now is None else now
+        before: dict = {}
+
+        def change(state: dict) -> None:
+            before.update({
+                "frozen_until": state["frozen_until"],
+                "frozen_until_mono": state["frozen_until_mono"],
+                "frozen_reason": state["frozen_reason"],
+                "frozen_for_sec": self.frozen_for(when),
+            })
+            state["frozen_until"] = 0.0
+            state["frozen_until_mono"] = 0.0
+            state["mono_at_freeze"] = 0.0
+            state["boot_at_freeze"] = 0.0
+            state["frozen_reason"] = ""
+
+        self._mutate(change, now, may_shorten=True)
+        record = {
+            "at": datetime.now(configmod.local_tz()).isoformat(timespec="seconds"),
+            "reason": str(reason or "no reason given"),
+            "was_frozen": before.get("frozen_for_sec", 0) > 0,
+            "cleared": before,
+        }
+        try:
+            configmod.guarded_append(
+                self.path.with_name(self.path.name + ".freezes.jsonl"),
+                [json.dumps(record, ensure_ascii=False)],
+                label="history freeze log",
+            )
+        except (configmod.GuardBusy, OSError):
+            record["recorded"] = False
+        else:
+            record["recorded"] = True
+        return record
+
     def record_request(self, now: float | None = None) -> dict:
-        """Count a getHistory that actually left the machine.
+        """Count a getHistory that actually left the machine, and stamp when.
 
         `now` is honoured rather than accepted and ignored: it decides which
         local day the request lands on, so a caller simulating another day gets
         that day instead of silently getting today.
+
+        `last_request_ts` is the durable half of the pacing. The gap between two
+        account calls was measured from a module global alone, which is zero in
+        a fresh interpreter -- and the agent runs this skill as a series of
+        separate `tg.py` invocations, so the first account call of every run
+        went out with no pause at all. The incident this module is written
+        against was a burst; the resolve ledger got a durable stamp for exactly
+        that reason and this file did not.
         """
+        when = time.time() if now is None else now
+
         def change(state: dict) -> None:
             state["requests"] += 1
+            state["last_request_ts"] = max(state.get("last_request_ts", 0.0), when)
 
         return self._mutate(change, now)
 
@@ -1422,6 +1409,9 @@ class HistoryLog:
             "history_frozen": left > 0,
             "history_frozen_for_sec": left,
             "history_frozen_reason": state["frozen_reason"],
+            # What `_pace_history` measures the next gap from, and the field
+            # that says whether the durable half of the pacing is there at all.
+            "last_request_ts": state["last_request_ts"],
         }
 
 
@@ -1460,7 +1450,13 @@ class PeerCache:
             # so a cache that went unreadable is visible instead of just empty.
             self.unreadable = f"{self.path} could not be read as a peer cache: {exc}"
             return {}
-        return {str(k).lower(): v for k, v in peers.items() if isinstance(v, dict)}
+        # `lstrip("@")` here as well as in `get` and `drop`. Keys were written
+        # verbatim by `put` and read back stripped, so a row stored under
+        # `@name` -- which is how a transport that echoes the requested name
+        # spells it -- could never be found or dropped again: the cache paid for
+        # a peer, kept it, and bought the same one over the budget next time.
+        return {str(k).lstrip("@").lower(): v
+                for k, v in peers.items() if isinstance(v, dict)}
 
     def get(self, username: str, fingerprint: str) -> dict | None:
         """The cached peer for this name under THIS login, or None."""
@@ -1490,7 +1486,7 @@ class PeerCache:
             return 0
         peers = self.read()
         for entry in keep:
-            peers[str(entry["username"]).lower()] = entry
+            peers[str(entry["username"]).lstrip("@").lower()] = entry
         self._write(peers)
         return len(keep)
 
@@ -1563,11 +1559,6 @@ class SourceRequest:
     username: str
     evidence: Any = None
     cached_peer: dict | None = None
-
-    @classmethod
-    def from_card(cls, card, cached_peer: dict | None = None) -> "SourceRequest":
-        return cls(username=getattr(card, "username", ""), evidence=card,
-                   cached_peer=cached_peer)
 
 
 @dataclass
@@ -1815,7 +1806,41 @@ class AccountSession:
     def __enter__(self) -> "AccountSession":
         self.lock.acquire()           # wait=0: a busy account fails now, not later
         self._open = True
+        try:
+            self._connect_transport()
+        except BaseException:
+            # The lock is only worth holding around a connection that exists.
+            self.lock.release()
+            self._open = False
+            raise
         return self
+
+    def _connect_transport(self) -> None:
+        """Open the wire, INSIDE the lock, unless it is open already.
+
+        The class docstring promises that the whole session runs inside
+        `AccountLock`, and the connection did not: the caller connected first and
+        entered afterwards, so the MTProto handshake and `is_user_authorized` --
+        two real calls on the identity -- happened before anything checked
+        whether another process already held the account. A second run against a
+        busy account therefore authorised a second connection and spent two
+        calls before `AccountBusy` reached it, which is precisely the two-writers
+        state the lock exists to prevent.
+
+        Compatibility, deliberately: a transport that is already connected is
+        left alone, so a caller that connects for itself keeps working and
+        nothing is connected twice. A dry run connects nothing at all, and a
+        transport with no `connect` -- the fake the whole suite runs on -- is
+        not asked for one.
+        """
+        if self.dry_run:
+            return
+        if getattr(self.transport, "connected", None):
+            return
+        connect = getattr(self.transport, "connect", None)
+        if not callable(connect):
+            return
+        connect()
 
     def __exit__(self, *exc):
         # The connection is closed before the lock is dropped. The lock exists to
@@ -2322,14 +2347,40 @@ class AccountSession:
         Nothing has ever measured a rate limit for this call on this account, so
         the gap the free surfaces use is borrowed rather than a number being
         invented for it. Sleeping is injected, like everywhere else here.
+
+        **The stamp is read off disk as well as out of the process.** It used to
+        come from a module global alone, which a new interpreter starts at zero,
+        and the skill is driven as a series of separate `tg.py` runs: the first
+        account call of every run went out with no pause, so three commands in a
+        row were a burst -- the one shape that has ever cost this account
+        downtime. The later of the two stamps wins, so a run still paces itself
+        exactly as before and now paces after the previous run as well.
         """
         gap = getattr(getattr(self.cfg, "budgets", None), "min_gap_sec", 0.0) or 0.0
-        last = last_history_ts_this_process()
-        if not gap or not last:
+        if not gap:
+            return
+        last = max(last_history_ts_this_process(), self._last_durable_request_ts())
+        if not last:
             return
         delay = (last + float(gap)) - time.time()
+        # Never longer than the gap itself. The stamp is now durable, so a clock
+        # that ran ahead when it was written would otherwise park every later
+        # run in `sleep` until the clock caught up.
+        delay = min(delay, float(gap))
         if delay > 0:
             self._sleep(delay)
+
+    def _last_durable_request_ts(self) -> float:
+        """The stamp the last account call of any run left on disk, or 0.0.
+
+        Never raises: `_history_stop_reason` has already read the same file and
+        refused if it could not be understood, so failing here would only turn a
+        refusal that has a sentence into an exception in the middle of pacing.
+        """
+        try:
+            return float(self.history_log.read().get("last_request_ts", 0.0) or 0.0)
+        except (AccountError, AttributeError, TypeError, ValueError):
+            return 0.0
 
     def _record_history_request(self) -> None:
         """One getHistory left the machine. Counted whether or not it answered."""
@@ -2374,14 +2425,21 @@ class AccountSession:
                 {"call": "messages.getHistory", "peer_id": peer.get("id"),
                  "limit": limit, "offset_id": offset_id, "options": options},
             )
+        before = self._history_requests
         rows, stopped = self._spend_one_call(
             "messages.getHistory",
             lambda: self.transport.fetch_history(
                 peer, limit=limit, offset_id=offset_id, options=options),
         )
         if stopped:
+            # What THIS call put on the wire, counted by the one function that
+            # knows: `self._flood_stop` is a run-local latch, so once the first
+            # FloodWait had set it every later refusal -- refusals taken locally,
+            # before `_require_live`, with nothing sent -- reported `requests: 1`
+            # against a call that never left the machine.
             return HistoryPage(username=request.username, dry_run=False,
-                               requests=1 if self._flood_stop else 0, stopped=stopped)
+                               requests=self._history_requests - before,
+                               stopped=stopped)
         return HistoryPage(username=request.username, messages=list(rows), requests=1,
                            dry_run=False)
 
@@ -2494,12 +2552,15 @@ class AccountSession:
             return {"query": text, "dry_run": True, "requests": 0, "peers": [],
                     "would": {"call": "contacts.search", "q": text,
                               "limit": limit, "options": options}}
+        before = self._history_requests
         rows, stopped = self._spend_one_call(
             "contacts.search",
             lambda: self.transport.search_contacts(text, limit=limit, options=options),
         )
         if stopped:
-            return {"query": text, "dry_run": False, "requests": 1 if self._flood_stop else 0,
+            # Counted per call, not off the run's flood latch -- see `history`.
+            return {"query": text, "dry_run": False,
+                    "requests": self._history_requests - before,
                     "peers": [], "stopped": stopped}
         cached = self.peer_cache.put(rows, self.fingerprint)
         return {"query": text, "dry_run": False, "requests": 1,
@@ -2527,14 +2588,16 @@ class AccountSession:
                     "would": {"call": "messages.search", "peer_id": peer.get("id"),
                               "q": text, "limit": limit, "add_offset": add_offset,
                               "options": options}}
+        before = self._history_requests
         payload, stopped = self._spend_one_call(
             "messages.search",
             lambda: self.transport.search_messages(
                 peer, text, limit=limit, add_offset=add_offset, options=options),
         )
         if stopped:
+            # Counted per call, not off the run's flood latch -- see `history`.
             return {"username": username, "query": text, "dry_run": False,
-                    "requests": 1 if self._flood_stop else 0,
+                    "requests": self._history_requests - before,
                     "messages": [], "total": None, "stopped": stopped}
         return {"username": username, "query": text, "dry_run": False, "requests": 1,
                 "messages": list(payload.get("messages", [])),
@@ -2578,46 +2641,29 @@ class AccountSession:
                 f"@{request.username}: {PEER_NOT_NUMERIC} Nothing was charged."
             )
         self._touch_lock()
-
-        def charge() -> None:
-            """The request left the machine, so the identity wore it.
-
-            Quietly on the failure paths: the ceiling is an audit trail as well
-            as a gate, and a ledger that cannot write must not replace the
-            failure the caller is already handling with a write error.
-            """
-            try:
-                self.ledger.record_join()
-            except Exception:
-                pass
-
+        # Reserved, not charged afterwards. The count used to be taken in the
+        # handlers below, and those catch `Exception` and `BaseException`: they
+        # see Ctrl-C and a supervisor's timeout, and they do not see `SIGKILL`,
+        # `taskkill /f` or a power cut, because none of those runs a handler.
+        # Measured on the resolve half before it was fixed the same way: three
+        # killed processes, three real calls, a ledger reading zero. This is the
+        # last thing that can refuse, and it refuses before the wire.
+        #
+        # It is also the only count now: a failure after this line is already
+        # paid for, which is the same "over-counting what left the machine is
+        # the safe direction" the handlers were written for.
+        self.ledger.reserve_join()
         try:
             result = joiner(peer, options=options)
         except AccountError:
-            # Counted even when it failed: the request left the machine and the
-            # identity wore it, which is what the ceiling is counting.
-            charge()
             raise
         except Exception as exc:
-            # The same rule, for every other way a transport can fail. Counting
-            # only `AccountError` meant a transport that failed in the ordinary
-            # way -- a reset connection, a bug -- bypassed the ceiling of 3
-            # indefinitely, and forwarded its own message and traceback while
-            # doing it.
-            charge()
+            # A transport that fails in the ordinary way -- a reset connection, a
+            # bug -- must not forward its own message and traceback to a caller
+            # that only handles this module's types.
             raise TransportError(
                 f"joining @{request.username} failed: {exc}"
             ) from None
-        except BaseException:
-            # Ctrl-C, a supervisor timeout, VS Code stopping the task: none of
-            # them is an `Exception`, so the join stayed on the wire and the
-            # ceiling was never charged. Three interrupted joins and the account
-            # has joined three groups with `joins_today = 0`. Over-counting what
-            # left the machine is the safe direction; under-counting is the one
-            # that bought the 36 468 s wait.
-            charge()
-            raise
-        self.ledger.record_join()
         return dict(result)
 
     # -- reporting ---------------------------------------------------------
@@ -2721,9 +2767,27 @@ def main(argv=None) -> int:
     not a traceback". It was a traceback, at exit 1, with the sentence inside it.
     Exit codes follow the skill's table: 7 for something the operator has to fix,
     9 for a failure this module did not foresee.
+
+    stdout is switched to UTF-8 first, exactly as `tg.py` does it for itself.
+    Without that line the promise above held only on a UTF-8 console: the status
+    JSON carries an em dash and a Telegram freeze reason carries anything at
+    all, so on cp437/cp850/cp1252 -- the default of an American Windows -- the
+    bare `print` died with `UnicodeEncodeError`, which is a traceback, zero
+    bytes of stdout and exit 1: the one code this table says must never be
+    produced. cp1251 did not raise but wrote cp1251 bytes, so redirecting the
+    status to a file produced JSON no reader of this skill can parse.
     """
     import argparse
     import sys as sysmod
+
+    for stream in (sysmod.stdout, sysmod.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # A stream that is not a reconfigurable text file -- a pipe a test
+            # substituted, a closed handle -- is left as it is. Failing to
+            # improve the encoding is not a reason to refuse to print a status.
+            pass
 
     parser = argparse.ArgumentParser(
         description="Account budget status. Reads the ledger, spends nothing.")

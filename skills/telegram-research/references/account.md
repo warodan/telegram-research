@@ -39,6 +39,12 @@ ledger, its ceilings and its 30 s gap all stay, as the fallback for a name the s
 will not return. Reaching it means writing a script against `AccountSession.resolve`;
 no CLI flag can.
 
+**Set `TELEGRAM_RESEARCH_ALLOW_LIVE` on the command, not in your shell profile.** From the
+command line the variable is the only switch there is, so a profile that exports it leaves
+the account open for every run in every project, including the ones that only meant to read
+a channel. `TELEGRAM_RESEARCH_ALLOW_LIVE=1 tg.py search <group> --query "..."` opens it for
+exactly one command.
+
 ## How it is reached at all — there is no command
 
 **`tg.py` has no account subcommand and that is deliberate.** Nothing on the
@@ -321,6 +327,14 @@ available. **This skill must not plan any workflow around `channels.searchPosts`
 
 ## Lifting a freeze — and the bound on one
 
+**There are two freezes, and everything in this section applies to both.** The
+resolve ledger freezes on a resolve FloodWait; `account-history.json` freezes on
+a FloodWait from `getHistory`, `contacts.search` or `messages.search` — and since
+no ordinary path resolves, the history one is the freeze a command line actually
+earns. Both are bounded the same way, both are cleared by `tg.py budget
+--unfreeze`, and each writes its own `.freezes.jsonl` beside itself. `tg.py
+budget` prints both and reports `frozen: true` when either is on.
+
 Two things were absolute about `frozen_until` and are not any more.
 
 **A freeze is bounded at `MAX_FREEZE_SEC` = 2 days.** `freeze(seconds, reason)`
@@ -369,6 +383,10 @@ because:
   second caller that per-process throttling cannot see. `AccountLock` is what stands
   between the two of them, and it is worth having even if you believe there is no second
   tool today.
+- **Keep the state directory on a local disk.** The lock rests on `O_EXCL`, which is not
+  reliable on NFS or SMB, and the liveness half of the stale check only applies to a lock
+  taken on this host. A state directory on a network share or a synced folder is a lock
+  that can be held twice. `TELEGRAM_RESEARCH_STATE` is what moves it.
 - A stale lock (a process that died mid-hold) is only broken after `stale_after` (default
   1800 s), and breaking it is recorded rather than silently overwritten — a lock is a
   safety device, not a queue to jump.

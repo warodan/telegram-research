@@ -24,7 +24,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -197,6 +197,27 @@ class AtomicWriteFailed(RuntimeError):
 
 _IS_WINDOWS = sys.platform == "win32"
 
+# How long a write guard is WAITED for, and how old a guard file has to be
+# before it is read as a dead writer's leftover. The two numbers belong
+# together and used to contradict each other: the wait was 20 s and the
+# threshold 120 s, so a waiter always gave up a hundred seconds before the
+# guard it was waiting on became breakable. A writer killed with `taskkill /F`
+# therefore blocked EVERY write -- the registry, `posts.jsonl`,
+# `fetchlog.jsonl`, `run.json`, `queries.json`, notes -- for two full minutes,
+# and each attempt burned 20 s of wall clock, some of it after the network
+# requests had already been paid for. Measured: a refusal at exactly 20.0 s,
+# repeated, until the two minutes were up.
+#
+# The threshold falls rather than the wait rising, because a hold is a
+# read-modify-write of one file: milliseconds, and at the very worst the ~2 s
+# `atomic_write_text` spends retrying a replace against a reader on NTFS.
+# Twenty seconds is an order of magnitude more than the longest honest hold,
+# and it is now the whole cost of a hard kill. The wait is strictly LONGER
+# than the threshold, so a waiter always outlives it and BREAKS the dead
+# guard rather than refusing one turn short of being allowed to.
+GUARD_STALE_AFTER = 20.0
+GUARD_TIMEOUT = 30.0
+
 
 def read_bytes_shared(path: Path) -> bytes:
     """Read a file without blocking another process's `os.replace` over it.
@@ -233,7 +254,17 @@ def read_bytes_shared(path: Path) -> bytes:
             if code in (2, 3):                       # FILE_NOT_FOUND / PATH_NOT_FOUND
                 raise FileNotFoundError(errno.ENOENT, "No such file", str(path))
             return path.read_bytes()                 # sharing violation and friends
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            fd = msvcrt.open_osfhandle(handle,
+                                       os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except Exception:
+            # The handle is ours until `open_osfhandle` takes ownership of it,
+            # and if that call raises, nothing else will ever close it. The
+            # fallback below then reads the file through `open()` and the
+            # process keeps one more handle on it for good -- which is the
+            # very condition this function exists to avoid.
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise
         with os.fdopen(fd, "rb") as fh:
             return fh.read()
     except FileNotFoundError:
@@ -292,8 +323,8 @@ class FileGuard:
     milliseconds around a read-modify-write.
     """
 
-    def __init__(self, path: Path, *, timeout: float = 10.0,
-                 stale_after: float = 60.0, poll: float = 0.005,
+    def __init__(self, path: Path, *, timeout: float = GUARD_TIMEOUT,
+                 stale_after: float = GUARD_STALE_AFTER, poll: float = 0.005,
                  label: str = "state"):
         self.path = Path(path)
         self.timeout = timeout
@@ -310,6 +341,10 @@ class FileGuard:
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout
+        # Whether the previous turn of the loop was already a free retry after
+        # a break. Two in a row would mean the guard is not going away, so the
+        # turn after one is charged against the deadline like every other.
+        retried_after_break = False
         while True:
             try:
                 # O_BINARY on Windows: without it the CRT translates the "\n"
@@ -325,13 +360,27 @@ class FileGuard:
                 self._token = token
                 return
             except FileExistsError:
-                if self._break_if_stale():
+                # Breaking a stale guard earns ONE immediate retry, never two
+                # in a row. This branch used to `continue` on every break, and
+                # `_break_if_stale` answered True whenever `stat` merely
+                # FAILED -- so a guard file whose `stat` kept raising span this
+                # loop straight back into `os.open` with no deadline check and
+                # no sleep: 200 000 turns in 13 s against a 0.2 s timeout, one
+                # core at 100 per cent, and the bounded wait never returned at
+                # all. A guard that reads as stale and does not go away is a
+                # broken `stat`, not a slot about to free.
+                if self._break_if_stale() and not retried_after_break:
+                    retried_after_break = True
                     continue
+                retried_after_break = False
                 if time.monotonic() >= deadline:
                     raise GuardBusy(
                         f"the {self.label} guard at {self.path} is held by another "
                         f"process and did not free in {self.timeout:.0f} s. "
-                        "The operation is refused rather than run unguarded."
+                        "The operation is refused rather than run unguarded. "
+                        "Delete that file if the process that took it is gone; "
+                        "it is also broken automatically once it is "
+                        f"{self.stale_after:.0f} s old."
                     )
                 time.sleep(self.poll)
             except PermissionError:
@@ -344,16 +393,29 @@ class FileGuard:
                     raise GuardBusy(
                         f"the {self.label} guard at {self.path} could not be taken "
                         f"in {self.timeout:.0f} s (the name is still being released). "
-                        "The operation is refused rather than run unguarded."
+                        "The operation is refused rather than run unguarded. "
+                        "Delete that file if the process that took it is gone; "
+                        "it is also broken automatically once it is "
+                        f"{self.stale_after:.0f} s old."
                     )
                 time.sleep(max(self.poll, 0.01))
 
     def _break_if_stale(self) -> bool:
-        """A guard older than `stale_after` belonged to a process that died."""
+        """A guard older than `stale_after` belonged to a process that died.
+
+        True means the name is free NOW -- this call removed it, or it was
+        already gone. Every OTHER `stat` failure answers False, because the
+        caller's answer to True is to try `os.open` again at once: a `stat`
+        that keeps failing (a permission the guard file no longer grants, a
+        share that dropped) used to be reported as "stale" for ever and spun
+        `acquire` at 100 per cent of one core with its timeout never firing.
+        """
         try:
             age = time.time() - self.path.stat().st_mtime
-        except OSError:
+        except FileNotFoundError:
             return True          # it vanished between the create and the stat
+        except OSError:
+            return False         # unreadable: wait it out rather than spin on it
         if age <= self.stale_after:
             return False
         try:
@@ -406,7 +468,8 @@ class FileGuard:
         return False
 
 
-def file_guard(path: Path, *, timeout: float = 20.0, stale_after: float = 120.0,
+def file_guard(path: Path, *, timeout: float = GUARD_TIMEOUT,
+               stale_after: float = GUARD_STALE_AFTER,
                label: str = "run") -> FileGuard:
     """The write guard for a data file, by the convention `Registry` set.
 
@@ -451,8 +514,9 @@ def append_lines(path: Path, lines) -> int:
     return len(payload)
 
 
-def guarded_append(path: Path, lines, *, timeout: float = 20.0,
-                   stale_after: float = 120.0, label: str = "run") -> int:
+def guarded_append(path: Path, lines, *, timeout: float = GUARD_TIMEOUT,
+                   stale_after: float = GUARD_STALE_AFTER,
+                   label: str = "run") -> int:
     """Append whole lines to a JSONL file under a cross-process guard.
 
     The registry has been written this way since the review measured 22 records
@@ -503,9 +567,6 @@ class Budgets:
     # the jargon loop
     max_rounds: int = 3
     min_new_posts_per_round: int = 3
-
-    def as_dict(self) -> dict:
-        return asdict(self)
 
 
 # The account block is not a tuning knob. `references/account.md` calls these
@@ -580,25 +641,18 @@ class Config:
         what actually went wrong.
         """
         try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            self.pace_dir.mkdir(parents=True, exist_ok=True)
+            # 0700, because the peer cache under here holds an `access_hash`
+            # per peer and the default umask leaves that readable by everyone
+            # on a shared machine. Windows ignores the mode; POSIX applies it
+            # to the directories this call creates and leaves an existing one
+            # exactly as the operator set it.
+            self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.pace_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError as exc:
             raise ConfigError(
                 f"the state directory {self.state_dir} could not be created: {exc}. "
                 + _mkdir_advice(exc, self.state_dir)
             ) from None
-
-    def as_dict(self) -> dict:
-        return {
-            "state_dir": str(self.state_dir),
-            "registry_path": str(self.registry_path),
-            "ledger_path": str(self.ledger_path),
-            "credential_path": str(self.credential_path) if self.credential_path else None,
-            "topics_vocabulary": str(self.topics_vocabulary) if self.topics_vocabulary else None,
-            "budgets": self.budgets.as_dict(),
-            "override_notes": list(self.override_notes),
-            "notice": CREDENTIAL_NOTICE,
-        }
 
 
 # Windows error numbers that mean something other than "that is a file".
@@ -908,11 +962,11 @@ def _announce_override_notes(cfg: Config) -> None:
     """Say on stderr that a configured value was refused and clamped.
 
     The clamp itself is right and is not the finding. The finding is that the
-    explanation went into `Config.override_notes`, whose only reader is
-    `Config.as_dict()`, which `tg.py` calls from nowhere -- so an operator who
-    set `daily_resolve_ceiling: 1000` and planned a session around it was
-    clamped to 180 with no word anywhere, and the run failed at 18 % with a
-    "ceiling reached" that contradicted the file on disk.
+    explanation went into `Config.override_notes`, which nothing printed -- so an
+    operator who set `daily_resolve_ceiling: 1000` and planned a session around
+    it was clamped to 180 with no word anywhere, and the run failed at 18 % with
+    a "ceiling reached" that contradicted the file on disk. `tg.py budget` now
+    reports the same notes as `config_notes`.
 
     stderr, not stdout: every subcommand's stdout is JSON an agent parses, and
     a warning belongs where it cannot corrupt that.
@@ -992,8 +1046,7 @@ def _apply_override(cfg: Config, path: Path) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(
                 f"{path}: 'budgets.{key}' must be a number, not "
-                f"{type(value).__name__} ({value!r}). A value of the wrong type "
-                "used to reach the ceiling check itself and fail there."
+                f"{type(value).__name__} ({value!r})."
             )
         try:
             # Through the one shared reader: `json.loads` accepts `NaN`,

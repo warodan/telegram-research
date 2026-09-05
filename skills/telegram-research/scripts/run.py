@@ -252,7 +252,11 @@ class Brief:
         what the file left out, and nothing more. `brief.json` written by
         `newrun` carries all three, so re-reading a run's own brief is unchanged.
         """
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        # `utf-8-sig`, because "UTF-8" in Notepad and in PowerShell 5.1's
+        # `Out-File` means UTF-8 with a BOM, and `json.loads` reads those three
+        # bytes as garbage before the opening brace. `newrun` writes this file,
+        # but the one a calling agent hands to `--brief` is written by anything.
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError(f"{path} must hold a JSON object, not {type(data).__name__}")
         known = {f for f in cls.__dataclass_fields__}
@@ -338,6 +342,10 @@ class Run:
         # processes that both attached at `requests: 15` and both spent 10 used
         # to write 25, and whichever wrote second erased the other's spend.
         self._baseline: dict[str, int] = {}
+        # What `fetchlog.jsonl`, `posts.jsonl` and `registry-delta.jsonl` held
+        # when this process last reconciled against them. `finish` uses it to
+        # tell its own uncounted spend from a sibling process's.
+        self._evidence: dict[str, int] = {}
         (self.root / "notes" / "sources").mkdir(parents=True, exist_ok=True)
 
     # -- construction ------------------------------------------------------
@@ -382,8 +390,15 @@ class Run:
         # Both forms, deliberately. The markdown is for a person; the JSON is
         # what every later stage reads back, and without it the report stage
         # cannot even name the question it answered.
-        (run.root / "brief.json").write_text(
-            json.dumps(brief.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        # Atomic, like `run.json` and `queries.json`. `write_text` truncates
+        # before it writes, so a `newrun` interrupted here left a half-written
+        # `brief.json` -- and every later command that read it died on the
+        # JSONDecodeError, including the ones that would have repaired the
+        # folder. `attach` survives that file now; this is why it should not
+        # have to.
+        cfg_module.atomic_write_text(
+            run.root / "brief.json",
+            json.dumps(brief.as_dict(), ensure_ascii=False, indent=2),
         )
         run.record_agent("newrun")
         run.finish()
@@ -414,14 +429,9 @@ class Run:
         except RunFolderError as exc:
             existing = {}
             rebuilt_from = str(exc)
+        brief_note: str | None = None
         if brief is None:
-            if (root / "brief.json").exists():
-                brief = Brief.from_file(root / "brief.json")
-            elif isinstance(existing.get("brief"), dict):
-                known = {f for f in Brief.__dataclass_fields__}
-                brief = Brief(**{k: v for k, v in existing["brief"].items() if k in known})
-            else:
-                brief = Brief(question="(brief written elsewhere)")
+            brief, brief_note = _recover_brief(root, existing)
         run = cls(root, brief)
         run.counters = {k: v for k, v in (existing.get("counters") or {}).items()}
         run.stop_reasons = list(existing.get("stop_reasons") or [])
@@ -432,11 +442,14 @@ class Run:
         if rebuilt_from is not None:
             kept = run._keep_damaged(root / "run.json")
             run.counters = run._counters_from_folder()
+            run._evidence = dict(run.counters)
             run.stop(
                 f"run.json could not be read ({rebuilt_from}); it was kept as "
                 f"{kept.name if kept else 'run.json'} and the counters below were "
                 "rebuilt by counting the run folder's own files"
             )
+        if brief_note is not None:
+            run.stop(brief_note)
         run._baseline = dict(run.counters)
         if rebuilt_from is None:
             # The counters were taken verbatim from a `run.json` that parsed.
@@ -464,14 +477,20 @@ class Run:
         brief that is 800 fresh requests granted after every hard kill, against
         a host whose rate limit has never been measured.
 
-        Only ever upward, and the baseline is left where it was, so `finish()`
-        writes the difference as this process's own delta and a concurrent
-        process cannot have its spend erased by our correction. Two processes
-        that both attach into the same gap will both correct it and the run
-        will over-count: that is the side that is safe -- over-count what
-        left this machine, never under-count it.
+        Only ever upward, and the baseline is RAISED WITH IT. The baseline
+        used to be left behind, which made the catch-up look like spend this
+        process had made: `finish()` wrote it as our own delta on top of
+        whatever was on disk. Under a parallel fan-out -- the documented way
+        `research` reads three channels -- the acts caught up on belong to a
+        sibling that is still running and writes them itself a moment later,
+        so the run counted them twice. Measured: 5 network acts in one process
+        and 1 in another, 6 lines in `fetchlog.jsonl` and 11 in `run.json`, and
+        the request ceiling firing at 55 per cent of its stated budget.
+        `finish` applies the same evidence as a FLOOR instead, which corrects
+        a dead process's spend without inventing a live one's.
         """
         evidence = self._counters_from_folder()
+        self._evidence = dict(evidence)
         missed = {k: v for k, v in evidence.items() if v > self.counters.get(k, 0)}
         if not missed:
             return
@@ -480,13 +499,14 @@ class Run:
             for key in sorted(missed)
         )
         self.counters.update(missed)
+        self._baseline.update(missed)
         self.stop(
-            f"run.json's spend was behind this folder's own files ({moved}); a "
-            "command killed outright logs its network acts and never gets to "
-            "write run.json, so the counters were raised to what fetchlog.jsonl, "
-            "posts.jsonl and registry-delta.jsonl prove. Over-counting what left "
-            "the machine is the safe side; under-counting re-arms the request "
-            "ceiling from zero."
+            f"run.json's spend was behind this folder's own files ({moved}); the "
+            "counters were raised to what fetchlog.jsonl, posts.jsonl and "
+            "registry-delta.jsonl prove. Two things leave a run in that state and "
+            "this cannot tell them apart: a command killed outright, which logs "
+            "its network acts and never gets to write run.json, and a sibling "
+            "process of the same fan-out that has not written its own spend yet."
         )
 
     # -- paths -------------------------------------------------------------
@@ -727,9 +747,15 @@ class Run:
         a folder nobody can trust.
         """
         data = cfg_module.redact_obj(data)
-        (self.root / "acceptance.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # Guarded and atomic, like `run.json` beside it. This was the last bare
+        # `write_text` in the run folder, on the one file whose absence means
+        # "this run was never accepted": `write_text` truncates before it
+        # writes, so an interrupt here left a truncated verdict that reads as a
+        # damaged run rather than as an unfinished one.
+        path = self.root / "acceptance.json"
+        with cfg_module.file_guard(path, label="acceptance.json"):
+            cfg_module.atomic_write_text(
+                path, json.dumps(data, ensure_ascii=False, indent=2))
         self.finish({"gate": {
             "tool": data.get("tool"),
             "checked_at": data.get("checked_at"),
@@ -784,6 +810,10 @@ class Run:
                 current = {}
                 self._keep_damaged(path)
             data = dict(current)
+            counters = self._floor_by_evidence(
+                _add_delta(current.get("counters"), self._baseline, self.counters),
+                current.get("counters"),
+            )
             data.update({
                 "schema": RUN_SCHEMA,
                 "run": self.root.name,
@@ -793,8 +823,7 @@ class Run:
                 "started": current.get("started") or self.started,
                 "finished": self.finished,
                 "brief": self.brief.as_dict(),
-                "counters": _add_delta(current.get("counters"),
-                                       self._baseline, self.counters),
+                "counters": counters,
                 "stop_reasons": _union(current.get("stop_reasons"), self.stop_reasons),
             })
             # Present but empty until `tg.py accept` runs. The checker reads a
@@ -814,9 +843,51 @@ class Run:
         # its own spend a second time.
         self.counters = dict(data.get("counters") or {})
         self._baseline = dict(self.counters)
+        self._evidence = self._counters_from_folder()
         self.agents = list(data.get("agents") or [])
         self.stop_reasons = list(data.get("stop_reasons") or [])
         return data
+
+    def _floor_by_evidence(self, merged: dict, stored: dict | None) -> dict:
+        """Raise the merged counters to what the run folder's own files prove.
+
+        `fetchlog.jsonl`, `posts.jsonl` and `registry-delta.jsonl` are appended
+        under a guard by every process writing this run, so for the three
+        counters they carry THEY are the ledger and no single process's
+        arithmetic is. What is written for those keys is `max(stored,
+        evidence)` -- plus whatever part of this process's own count the folder
+        cannot account for, which is how a counter bumped without a line behind
+        it still survives.
+
+        The delta alone got this wrong in both directions at once. A process
+        that attached into another's gap wrote the catch-up as its own spend,
+        and the process it caught up on then wrote the same acts again:
+        measured at 6 lines in `fetchlog.jsonl` against 11 in `run.json`. A
+        floor cannot double-count, because it compares against the file both
+        processes appended to.
+
+        It never lowers a counter the folder says nothing about. A trimmed
+        fetch log leaves `stored` standing, and a counter with no file behind
+        it -- `account_calls` -- never reaches this method at all, because
+        `_counters_from_folder` does not produce that key.
+        """
+        evidence = self._counters_from_folder()
+        if not evidence:
+            return merged
+        stored = stored or {}
+        out = dict(merged)
+        for key, proven in evidence.items():
+            try:
+                was = int(stored.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                was = 0
+            own = self.counters.get(key, 0) - self._baseline.get(key, 0)
+            # How much of this process's own count the folder has taken in
+            # since we last reconciled with it. Anything beyond that is a
+            # count with no line behind it and is still added on top.
+            growth = max(0, proven - self._evidence.get(key, 0))
+            out[key] = max(was, proven) + max(0, own - growth)
+        return out
 
     def _keep_damaged(self, path: Path) -> Path | None:
         """Move an unreadable `run.json` aside instead of overwriting it.
@@ -857,6 +928,51 @@ class Run:
         counters["posts"] = len(distinct) + sum(
             1 for p in posts if post_key(p) is None)
         return {k: v for k, v in counters.items() if v}
+
+
+def _recover_brief(root: Path, existing: dict) -> "tuple[Brief, str | None]":
+    """The run's brief: from `brief.json`, or from `run.json` when that fails.
+
+    `attach` called `Brief.from_file` bare, so a `brief.json` that would not
+    parse ended the whole folder. `newrun` wrote that file with a plain
+    `write_text` -- truncate first -- so an interrupt during `newrun` produced
+    exactly this state, and from then on `note`, `report`, `accept`, `queries`
+    and every `--run <that folder>` died with a `JSONDecodeError` that named
+    neither the file nor a way out. The documented repair goes through
+    `attach` itself, so it died too.
+
+    The fallback was already here and unreachable: `finish()` writes a copy of
+    the brief into `run.json` on the very first command, and the branch that
+    reads it back could only be entered when `brief.json` did not exist at
+    all. Returns the brief and, when one had to be recovered, the sentence
+    that says so -- the caller records it in the run's stop reasons, because a
+    run answering a question this folder can no longer prove it was asked has
+    to say which file to look at.
+    """
+    path = Path(root) / "brief.json"
+    stored = existing.get("brief")
+    stored = stored if isinstance(stored, dict) else None
+    note = None
+    if path.exists():
+        try:
+            return Brief.from_file(path), None
+        except (ValueError, OSError) as exc:
+            note = (
+                f"{path} could not be read ({exc}), so it was not used. "
+                + ("The brief below is run.json's own copy of it. Move the "
+                   "unreadable file aside if you want `newrun` to write a "
+                   "fresh one."
+                   if stored else
+                   "run.json holds no copy of the brief either, so this run's "
+                   "question is not recoverable from the folder.")
+            )
+    if stored is not None:
+        known = {f for f in Brief.__dataclass_fields__}
+        try:
+            return Brief(**{k: v for k, v in stored.items() if k in known}), note
+        except (TypeError, ValueError):
+            pass
+    return Brief(question="(brief written elsewhere)"), note
 
 
 class RunFolderError(RuntimeError):
@@ -925,8 +1041,9 @@ def require_run_folder(path, *, allow_empty: bool = False,
         # `queries.json`, `queries.md`, `run.json` and a `notes/` tree into
         # whatever folder the caller happened to be standing in.
         raise NotARunFolder(
-            "the run folder is empty. Pass the path `tg.py newrun` printed; "
-            "an empty one used to mean the current directory"
+            "the run folder is empty. Pass the path `tg.py newrun` printed: an "
+            "empty one would resolve to the directory this was called from, and "
+            "write a run into it."
         )
     root = Path(path)
     if not root.exists():
@@ -1082,14 +1199,29 @@ def _distinct_posts(posts) -> tuple[set, int]:
 
 
 def _free_folder(root: Path, limit: int = 99) -> Path:
-    """`root`, or the first `-N` beside it that is not already a run."""
+    """`root`, or the first `-N` beside it that is not already a run.
+
+    The name is CLAIMED by creating it, not merely inspected. Two `newrun`
+    processes started together on the same question and the same day both saw
+    the same directory missing and both returned it, after which the second
+    one's brief overwrote the first one's and the two runs shared one
+    `posts.jsonl` -- which is the very thing the `-N` suffix exists to
+    prevent. `mkdir` without `exist_ok` is the one test that cannot be raced:
+    exactly one of them creates the directory and the other moves along.
+
+    An empty directory that is already there is not claimable this way and is
+    therefore skipped rather than filled, which costs a leftover name after a
+    crashed `newrun` and settles the race for good.
+    """
     root = Path(root)
-    if not root.exists() or not any(root.iterdir()):
-        return root
-    for n in range(2, limit + 1):
-        candidate = root.with_name(f"{root.name}-{n}")
-        if not candidate.exists() or not any(candidate.iterdir()):
-            return candidate
+    names = [root] + [root.with_name(f"{root.name}-{n}")
+                      for n in range(2, limit + 1)]
+    for candidate in names:
+        try:
+            candidate.mkdir(parents=True)
+        except FileExistsError:
+            continue
+        return candidate
     raise RunFolderError(
         f"{limit} run folders already exist beside {root}; name the question "
         "differently rather than adding a hundredth"

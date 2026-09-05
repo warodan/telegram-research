@@ -110,12 +110,9 @@ Four fields answer "did the walk reach the end?" and all four say no, so this is
 there. `members` is a live counter, so that figure is the reading at the moment of this run, not a fixed number.
 `selftest` runs offline and says whether an empty answer means "quiet channel" or "changed front end".
 
-**Trimmed for this page; no value above is edited**, only wrapped tighter than the printed output. Dropped: 21
-of the 22 sticker posts, 19 of the 20 history posts, 8 of the 9 links on the post that is shown, and the
-envelope around the three short blocks. Dropped too: `stopped_early`, `page_ceiling` and the list of queries the
-surface capped; on every post `username`, `channel_title`, `views`, `chat_id` and the media, reaction and
-source-file fields; on the `verify` card `taken`, `description` and `photo`; and keys that were `null` or `0`
-here. Commands print more, never less.
+**Trimmed for this page; no value above is edited.** Dropped: 21 of the 22 sticker posts, 19 of the 20 history
+posts, most of the links on the post that is shown, and the fields that were empty, repeated or about the
+media. Commands print more, never less.
 
 | At a glance | |
 |---|---:|
@@ -157,6 +154,9 @@ npx skills@latest add warodan/telegram-research
 
 The [skills.sh](https://skills.sh/) installer asks whether to put the skill into the current project or globally
 (`-g` skips the question). After installing, **restart your agent** — skills are read at startup.
+
+Channels work from that moment on, with nothing else to set up. Groups need a one-time account setup — see
+[The Telegram account](#the-telegram-account-groups-only).
 
 ### Or have your agent install it
 
@@ -222,7 +222,9 @@ TELEGRAM_RESEARCH_ALLOW_LIVE=1
 
 Only `1`, `true`, `yes` or `on` count. Anything else — unset, empty, `0`, `false` — and the three account
 commands refuse at exit 7 with the reason, having read no credential and sent nothing. It is read at every call,
-so unsetting it stops a run already in flight.
+so unsetting it stops a run already in flight. **Set it on the command rather than in your shell profile** — a
+profile that exports it leaves the account open for every run in every project, including the ones that only
+meant to read a channel.
 
 Check the state any time with the skill's own `scripts/account.py`: no network call, no credential read, and it
 prints today's spend, any freeze, and whether Telethon is installed. `tg.py budget` is the short version.
@@ -269,7 +271,9 @@ phrasings trigger it too; the skill's description carries them alongside the Eng
 
 Working state — the source registry, history cursors, the resolve ledger, the account lock and the peer cache —
 lives in **`~/.telegram-research/`**, outside every project and outside the skill's own folder, so an installer
-update that replaces the skill folder cannot take the record of an account freeze with it.
+update that replaces the skill folder cannot take the record of an account freeze with it. Keep that directory
+to yourself and on a local disk: the peer cache holds Telegram's `access_hash` for the groups you looked at,
+and the account lock rests on a file-creation guarantee that network shares do not give.
 
 Run folders are created in **`telegram-runs/`** inside the project you are working in, one per run — and what
 lands there is other people's data: `posts.jsonl` keeps every fetched post as it was served, including the
@@ -281,7 +285,7 @@ a run once you are done with it.
 | Requirement | Details |
 |---|---|
 | An agent with skills | Claude Code, plus any agent `npx skills` installs into (Cursor, Copilot, Gemini CLI and others) |
-| Python 3 | on `PATH` as `python` or `python3`. **Standard library only** — the newest stdlib call used is `str.removeprefix` (3.9); developed and tested on 3.14 |
+| Python 3 | on `PATH` as `python` or `python3`. **Standard library only** — the newest stdlib call used is `bytes.removeprefix` (3.9); developed and tested on 3.14 |
 | Node.js | only to run `npx` for the install; not needed afterwards |
 | A Telegram account, plus Telethon | **groups only**, never for channels: `pip install telethon==1.44.0` and the [setup above](#the-telegram-account-groups-only). The skill never installs it and works without it |
 
@@ -289,7 +293,7 @@ a run once you are done with it.
 
 ```
 telegram-research/                # the repository
-├── skills/telegram-research/     # ← THE ONLY THING THAT GETS INSTALLED
+├── skills/telegram-research/     # ← the only thing that gets installed
 │   ├── SKILL.md                  # the skill instructions: the three stages and the rules that matter
 │   ├── references/
 │   │   ├── cli.md                # every command, flag, exit code and environment variable
@@ -306,12 +310,16 @@ telegram-research/                # the repository
 ```
 
 The installer copies `skills/telegram-research/` verbatim and nothing else; the rest of the tree stays in the
-repository. That is why the suite sits outside the skill — 931 tests against a 32-page corpus, and the skill
-reads none of it at runtime. The 10 pages `selftest` parses do travel with the skill, because `selftest` is a
+repository. That is why the suite sits outside the skill — 1049 tests against a 32-page probe corpus, and the skill
+reads none of it at runtime. To run it, clone the repository and from its root: `pip install pytest && python -m
+pytest`. Every test is offline. The 10 pages `selftest` parses do travel with the skill, because `selftest` is a
 command a user runs: an installed copy self-tests with no file from this repository.
 
 Most of that corpus is saved pages of public Telegram channels and groups; the rest are authored stand-ins. The
-captures belong to their authors and are kept here only as test material, with personal data replaced.
+captures belong to their authors and are kept here only as test material, with personal data replaced. One
+group goes further: it appears as `birding_chats` throughout, and its display name, avatar, numeric id and
+message text are stand-ins too, so nothing in these files names the group or the subject. Message
+ids, dates, counters and markup are untouched, so every measurement taken on it is real.
 
 ## Limitations
 
@@ -326,6 +334,9 @@ captures belong to their authors and are kept here only as test material, with p
   names measured there were dead, and whole groups are missing from it.
 - **The album branch is unguarded.** None of the probe pages carries a grouped-message wrapper, so `selftest`
   cannot notice the id-splitting for albums breaking — an album count is the one number it does not stand behind.
+- **It identifies as a browser.** Requests carry a desktop Chrome `User-Agent` instead of naming this skill:
+  `t.me` served every saved page under a bare client, but the third-party index was only ever measured under a
+  browser one.
 - **It reads; the judgement is yours.** The report skeleton is built from counters and saved pages; what a
   silence implies and what the jargon means are written by the agent, and nothing marks which sentence is which.
 

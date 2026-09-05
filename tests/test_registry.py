@@ -1189,7 +1189,7 @@ def test_the_backup_is_written_through_the_guarded_atomic_helper(tmp_path):
     reg = Registry(path)
     reg.append(Source(username="alpha", type="channel", members=1))
     with path.open("ab") as fh:
-        fh.write(b'{"username": "cp", "title": "' + "Ханой".encode("cp1251") + b'"}\n')
+        fh.write(b'{"username": "cp", "title": "' + "Птицы".encode("cp1251") + b'"}\n')
     before = path.read_bytes()
 
     seen: list[str] = []
@@ -1319,3 +1319,93 @@ def test_a_member_count_nothing_can_read_is_not_a_member_count():
                   "exists": True, "status": "alive"}, rules).admit is False
     assert judge({"username": "somechan", "type": "channel", "members": "500",
                   "exists": True, "status": "alive"}, rules).admit is True
+
+
+# --------------------------------------------------------------------------
+# Reading the registry must not be able to break writing it
+# --------------------------------------------------------------------------
+def test_a_reader_in_the_middle_of_iter_raw_cannot_fail_a_compaction(
+    tmp_path, monkeypatch
+):
+    """`iter_raw` opened the file with a plain `open("rb")` and is a GENERATOR,
+    so the handle stayed open for as long as the caller walked it -- the whole
+    of `load()`, and therefore the whole of almost every command.
+
+    On NTFS CPython's `open()` does not pass FILE_SHARE_DELETE, so one ordinary
+    reader was enough to fail `os.replace` over the same name. Measured: a
+    reader mid-`iter_raw` plus a `compact()` -> refusal after 2.1 s and exit 9.
+    `config.read_bytes_shared` was written for exactly this and every other
+    reader in the skill already used it.
+    """
+    path = tmp_path / "sources.jsonl"
+    reg = Registry(path)
+    reg.append(Source(username="durov", members=100))
+    reg.append(Source(username="tdlibchat", type="group", members=900))
+
+    seen = []
+    real = configmod.read_bytes_shared
+
+    def spy(target):
+        seen.append(Path(target))
+        return real(target)
+
+    monkeypatch.setattr(configmod, "read_bytes_shared", spy)
+    rows = list(reg.iter_raw())
+    assert len(rows) == 2
+    assert path in seen, "iter_raw did not go through the shared reader"
+
+    # And the file can be replaced under a reader that is only half-done.
+    monkeypatch.undo()
+    walker = reg.iter_raw()
+    next(walker)
+    assert reg.compact() == 2
+    assert sorted(reg.load()) == ["durov", "tdlibchat"]
+
+
+def test_a_compaction_that_cannot_replace_the_file_takes_its_backup_back(
+    tmp_path, monkeypatch
+):
+    """The backup is written BEFORE the registry is replaced, so a compaction
+    that then failed left a `.bak` nobody asked for.
+
+    The next attempt refused with `_refuse_to_lose_the_backup` -- a message
+    about an earlier `--force` compaction that never happened -- and offered
+    `--force` as the way out, which presents the accident as a deliberate
+    replacement. A backup this call created and could not earn is removed
+    again; one that was already on disk is somebody else's evidence and is left
+    alone.
+    """
+    path = tmp_path / "sources.jsonl"
+    reg = Registry(path)
+    reg.append(Source(username="durov", members=100))
+
+    real_write = configmod.atomic_write_text
+
+    def refuse_the_registry(target, text, **kwargs):
+        if Path(target) == path:
+            raise configmod.AtomicWriteFailed(
+                f"could not replace {target}: another process is holding it open")
+        return real_write(target, text, **kwargs)
+
+    monkeypatch.setattr(configmod, "atomic_write_text", refuse_the_registry)
+    with pytest.raises(configmod.AtomicWriteFailed):
+        reg.compact()
+    assert not reg.backup_path().exists(), (
+        "a failed compaction left its own backup behind, and the next attempt "
+        "refuses because of it")
+
+    # So the next attempt is an ordinary compaction, with no `--force` and no
+    # story about bytes an earlier run salvaged.
+    monkeypatch.undo()
+    assert reg.compact() == 1
+    assert reg.backup_path().exists()
+
+
+def test_the_registry_write_guard_outlasts_its_own_staleness_threshold(tmp_path):
+    """20 s of waiting against a 120 s staleness threshold: a writer killed
+    mid-write blocked every registry write for two full minutes, and each
+    attempt burned 20 s of wall clock to say so."""
+    reg = Registry(tmp_path / "sources.jsonl")
+    guard = reg._guard()
+    assert guard.timeout > guard.stale_after, (guard.timeout, guard.stale_after)
+    assert guard.stale_after == configmod.GUARD_STALE_AFTER

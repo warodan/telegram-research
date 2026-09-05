@@ -6,6 +6,7 @@ No network, no installs. Every file lives under tmp_path.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -356,8 +357,6 @@ def test_override_cannot_raise_the_account_ceilings(tmp_path, monkeypatch):
     assert cfg.budgets.burst_window_sec == 600
     assert len(cfg.override_notes) == 5
     assert any("clamped" in note for note in cfg.override_notes)
-    # and the change is visible to whoever prints the configuration
-    assert cfg.as_dict()["override_notes"] == cfg.override_notes
 
 
 def test_override_may_still_tighten_the_account_budgets(tmp_path, monkeypatch):
@@ -449,7 +448,7 @@ def test_a_credential_file_written_through_redact_leaks_nothing(tmp_path):
     """
     session = "2BVtsOMTQ5" + "Q" * 60
     api_hash = "FEDCBA9876543210FEDCBA9876543210"
-    api_id = "27461930"
+    api_id = "12345678"
     blob = (
         "TELEGRAM_API_ID=" + api_id + "\n"
         "TELEGRAM_API_HASH=" + api_hash + "\n"
@@ -686,7 +685,7 @@ def test_a_topics_vocabulary_that_is_not_there_is_refused(tmp_path, monkeypatch)
 def test_a_clamped_account_ceiling_is_announced_and_not_only_recorded(
         tmp_path, monkeypatch, capsys):
     """The explanation went into `Config.override_notes`, whose only reader
-    is `Config.as_dict()`, which `tg.py` calls from nowhere. An operator who set
+    is nothing that prints. An operator who set
     1000 resolves was clamped to 180 with no word anywhere."""
     import config as config_module
 
@@ -1459,3 +1458,181 @@ def test_the_run_root_a_global_install_loads_is_the_working_directory(
     cfg = load()
     assert cfg.root == project.resolve()
     assert home not in cfg.root.parents
+
+
+# --------------------------------------------------------------------------
+# The write guard's two numbers, and the loop that waits on them
+# --------------------------------------------------------------------------
+def test_a_dead_writers_guard_is_broken_before_the_wait_runs_out(tmp_path):
+    """The wait was 20 s and the staleness threshold 120 s, so the waiter always
+    gave up a hundred seconds before the guard could be broken.
+
+    Measured with a writer killed mid-write: every subsequent write -- the
+    registry, `posts.jsonl`, `fetchlog.jsonl`, `run.json`, `queries.json`,
+    notes -- refused at exactly 20.0 s, and went on refusing for two minutes.
+    Each refusal burned 20 s of wall clock, some of it after the network
+    requests it was trying to record had already been paid for.
+    """
+    import os
+    import time
+
+    import config as config_module
+
+    assert config_module.GUARD_TIMEOUT > config_module.GUARD_STALE_AFTER, (
+        "a waiter that gives up before the guard it waits on can be broken "
+        "turns one killed writer into a total outage"
+    )
+    target = tmp_path / "state" / "posts.jsonl"
+    target.parent.mkdir(parents=True)
+
+    # Exactly what a killed writer leaves: the guard file, and nobody holding it.
+    dead = config_module.file_guard(target, label="posts")
+    dead.path.write_bytes(b"999999 0.000 deadbeef\n")
+    aged = time.time() - (config_module.GUARD_STALE_AFTER + 1.0)
+    os.utime(dead.path, (aged, aged))
+
+    started = time.monotonic()
+    assert config_module.guarded_append(target, ['{"kind": "fetch"}']) == 1
+    assert time.monotonic() - started < 5.0, "the write waited out the threshold"
+    assert target.read_text(encoding="utf-8").strip() == '{"kind": "fetch"}'
+
+
+def test_a_guard_whose_stat_keeps_failing_times_out_instead_of_spinning(
+    tmp_path, monkeypatch
+):
+    """`_break_if_stale` answered True whenever `stat` merely FAILED, and the
+    caller's answer to True is `continue` -- straight back to `os.open`, with no
+    deadline check and no sleep in between.
+
+    Measured with a `stat` that raises every time: 200 000 turns of the loop in
+    13 s at a 0.2 s timeout, one core at 100 %, and the bounded wait never
+    returned at all. A guard that reads as stale and does not go away is a
+    broken `stat`, not a slot about to free.
+    """
+    import time
+
+    import config as config_module
+
+    guard_path = tmp_path / "state" / "sources.jsonl.write"
+    guard_path.parent.mkdir(parents=True)
+    guard_path.write_bytes(b"1 0.000 aabbccdd\n")
+
+    real_stat = Path.stat
+    turns = {"n": 0}
+
+    def broken_stat(self, *args, **kwargs):
+        if str(self) == str(guard_path):
+            turns["n"] += 1
+            if turns["n"] > 2000:
+                raise AssertionError(
+                    f"`acquire` span {turns['n']} times on one unreadable guard "
+                    "with its timeout never firing"
+                )
+            raise PermissionError(5, "access is denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", broken_stat)
+    guard = config_module.FileGuard(guard_path, timeout=0.2, poll=0.01,
+                                    stale_after=20.0, label="registry")
+    started = time.monotonic()
+    with pytest.raises(config_module.GuardBusy) as refusal:
+        guard.acquire()
+    assert time.monotonic() - started < 5.0
+    assert turns["n"] < 200, f"{turns['n']} stat calls for a 0.2 s wait"
+
+    # And the refusal says what to do about it: which file, and that it clears
+    # itself. It used to name the file and stop there.
+    message = str(refusal.value)
+    assert str(guard_path) in message
+    assert "20 s old" in message, message
+
+
+# --------------------------------------------------------------------------
+# What the state directory is readable by
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_the_state_directory_is_not_readable_by_the_whole_machine(tmp_path):
+    """The peer cache under the state directory holds an `access_hash` per
+    peer, and the directory was created with the ambient umask -- world-readable
+    on any shared Linux box."""
+    import stat as stat_module
+
+    cfg = Config(state_dir=tmp_path / "state")
+    cfg.ensure_dirs()
+    mode = stat_module.S_IMODE(os.stat(cfg.state_dir).st_mode)
+    assert mode == 0o700, oct(mode)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows HANDLE path")
+def test_a_failed_open_osfhandle_does_not_leak_the_windows_handle(
+    tmp_path, monkeypatch
+):
+    """`read_bytes_shared` opens a raw HANDLE and hands it to
+    `msvcrt.open_osfhandle`, which takes ownership of it. If that call raised,
+    nothing closed the handle -- and the fallback then opened the file AGAIN
+    through `open()`, so the process kept a handle on it for good. That is the
+    exact condition this function exists to avoid."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import msvcrt
+
+    import config as config_module
+
+    path = tmp_path / "sources.jsonl"
+    path.write_bytes(b"x" * 32)
+
+    def refuse(*args, **kwargs):
+        raise OSError("no free file descriptor")
+
+    monkeypatch.setattr(msvcrt, "open_osfhandle", refuse)
+
+    # The signatures are declared, not assumed: with the default `c_int`
+    # return type `GetCurrentProcess` hands back a truncated pseudo-handle,
+    # the count call fails, and the counter reads 0 both times -- a leak test
+    # that cannot see a leak.
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.GetProcessHandleCount.argtypes = [ctypes.c_void_p,
+                                          ctypes.POINTER(wintypes.DWORD)]
+    k32.GetProcessHandleCount.restype = wintypes.BOOL
+
+    def handles() -> int:
+        count = wintypes.DWORD()
+        assert k32.GetProcessHandleCount(k32.GetCurrentProcess(),
+                                         ctypes.byref(count))
+        return count.value
+
+    before = handles()
+    for _ in range(300):
+        assert config_module.read_bytes_shared(path) == b"x" * 32
+    leaked = handles() - before
+    assert leaked < 50, f"{leaked} handles left open by 300 failed reads"
+
+
+def test_the_three_state_guards_read_both_constants_at_call_time(tmp_path, monkeypatch):
+    """Half a pair frozen at import is the same outage, harder to see.
+
+    `timeout > stale_after` is the invariant that lets a waiter outlive a dead
+    writer's guard. The registry, the resolve ledger and the history log took
+    the timeout as a default argument -- bound once, at import -- while reading
+    its partner at call time, so moving both moved only one and inverted the
+    pair silently.
+    """
+    import config as config_module
+    import account as account_module
+    import registry as registry_module
+    import resolve as resolve_module
+
+    monkeypatch.setattr(config_module, "GUARD_TIMEOUT", 0.3)
+    monkeypatch.setattr(config_module, "GUARD_STALE_AFTER", 0.2)
+
+    guards = [
+        registry_module.Registry(tmp_path / "sources.jsonl")._guard(),
+        resolve_module.ResolveLedger(tmp_path / "ledger.json", daily_ceiling=1,
+                                     burst_ceiling=1, burst_window=1, min_gap=1,
+                                     join_ceiling=1)._guard(),
+        account_module.HistoryLog(tmp_path / "history.json")._guard(),
+    ]
+    for guard in guards:
+        assert (guard.timeout, guard.stale_after) == (0.3, 0.2), guard.label
+        assert guard.timeout > guard.stale_after
